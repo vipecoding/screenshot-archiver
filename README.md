@@ -2,15 +2,15 @@
 
 A [Swamp](https://github.com/swamp-club/swamp) behavior extension (`@matty/screenshot-archiver`) and workflow that safely archives macOS screenshots (`Screenshot YYYY-MM-DD at ...`) and screen recordings (`Screen Recording YYYY-MM-DD at ...`) from a source folder (such as `~/Desktop`) into Obsidian-style date folders (`YYYY/MM/DD`) in iCloud Drive or any local vault directory.
 
-Every file is verified to be a genuine macOS screen capture via extended attributes (`com.apple.metadata:kMDItemIsScreenCapture` or `com.apple.metadata:kMDItemIsScreenRecording`), copied via Homebrew `rsync -aXN` (preserving macOS extended attributes and APFS creation timestamps), verified with `rsync --dry-run --checksum --itemize-changes`, `xattr`, **and** a Web Crypto SHA-256 byte-for-byte digest comparison, and only then removed from the source directory.
+Every file is verified to be a genuine macOS screen capture via extended attributes (`com.apple.metadata:kMDItemIsScreenCapture` or `com.apple.metadata:kMDItemIsScreenRecording`), copied via Homebrew `rsync -aXN` (preserving macOS extended attributes and APFS creation timestamps), verified with `rsync --dry-run -aXN --checksum --itemize-changes` and `xattr`, and only then removed from the source directory.
 
 ## Key Features
 
 - **Genuine Screen Capture Verification:** Batch-inspects macOS Spotlight extended attributes (`xattr`) so arbitrary files that happen to start with `Screenshot ` are never touched, and APFS/iCloud dataless files are not downloaded during attribute inspection.
-- **Two-Step Verified Transfer (`rsync -aXN` + SHA-256 + `xattr`):**
-  1. Copies each eligible file (`fileDate < today` when `keepToday: true`) into `<destRoot>/<dateFormat>/<filename>` using Homebrew `rsync -aXN` (preserving extended attributes and creation timestamps).
-  2. Verifies the destination copy with `rsync --dry-run --checksum --itemize-changes`, confirms the destination file has the screen-capture extended attribute, and compares full-file SHA-256 digests (`sourceSha256 === destSha256`) before deleting the source file.
-- **Content-Hash Deduplication & In-Place Metadata Sync:** If a file with the same name already exists in the destination date folder, compares byte size, `rsync --checksum`, and SHA-256. Identical files are deduplicated in place (syncing any missing extended attributes and creation timestamps via `rsync -aXN`) without creating ` (1)` duplicates; files with different contents are safely written to `filename (1).ext`.
+- **Two-Step Verified Transfer (`rsync -aXN` + `--checksum` + `xattr`):**
+  1. Copies each eligible file (`fileDate < today` when `keepToday: true`) into `<destRoot>/<dateFormat>/<filename>` using Homebrew `rsync -aXN` (staging atomically via a temporary dot-file and preserving extended attributes and creation timestamps).
+  2. Verifies the destination copy with `rsync --dry-run -aXN --checksum --itemize-changes`, confirms the destination file has the screen-capture extended attribute and matching creation timestamp, and only then deletes the source file.
+- **Content-Checksum Deduplication & In-Place Metadata Sync:** If a file with the same name already exists in the destination date folder, compares byte size and `rsync --checksum`. Identical files are deduplicated in place (syncing any missing extended attributes and creation timestamps on the existing inode via `rsync -aXN --checksum`) without creating ` (1)` duplicates; files with different contents are safely written to `filename (1).ext`.
 - **Configurable Date Subfolders:** Supports Obsidian daily note subfolder patterns using `YYYY`, `YY`, `MM`, and `DD` tokens (default `YYYY/MM/DD`, e.g. `2026/11/04`).
 - **Buddhist Calendar Year Normalization:** Automatically normalizes macOS Buddhist Era calendar years (`year > referenceYear + 500` → `year - 543`, e.g. `2569-03-04` → `2026-03-04`).
 
@@ -63,12 +63,12 @@ Scans `sourceDir` for macOS screenshots and screen recordings, checks extended a
 
 #### 2. `archive`
 
-Copies eligible screenshots and screen recordings into `<destRoot>/<dateFormat>/`, verifies each file via `rsync --checksum` and SHA-256 (deduplicating identical files), and removes verified source files from `sourceDir`.
+Copies eligible screenshots and screen recordings into `<destRoot>/<dateFormat>/`, verifies each file via `rsync -aXN --checksum` (deduplicating identical files), and removes verified source files from `sourceDir`.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dryRun` | `boolean` | `false` | When `true`, previews which files would be archived (`status: "would-archive"`) without creating folders or moving files. |
-| `deleteSource` | `boolean` | `true` | When `true`, deletes each source file after `rsync --checksum` and SHA-256 verification succeed. Set to `false` to copy and verify without deleting from `sourceDir`. |
+| `deleteSource` | `boolean` | `true` | When `true`, deletes each source file after `rsync -aXN --checksum` verification succeeds. Set to `false` to copy and verify without deleting from `sourceDir`. |
 | `sourceDir` | `string` *(optional)* | `globalArgs.sourceDir` | Override the source directory (files are scanned and deleted from this directory when `deleteSource: true`). |
 | `destRoot` | `string` *(optional)* | `globalArgs.destRoot` | Override the destination root directory (useful for testing into a temporary directory). |
 

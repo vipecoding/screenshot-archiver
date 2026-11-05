@@ -1,11 +1,10 @@
 /**
  * Archive macOS Desktop screenshots and screen recordings into configurable
- * date folders in iCloud Drive / Obsidian using a verified two-step rsync +
- * checksum workflow before removing source files.
+ * date folders in iCloud Drive / Obsidian using a verified two-step rsync
+ * (`-aXN` + `--checksum`) workflow before removing source files.
  *
  * @module
  */
-import { createHash } from "node:crypto";
 import { extname, join, parse } from "node:path";
 import { z } from "npm:zod@4";
 
@@ -60,7 +59,6 @@ const CandidateFileSchema = z.object({
   destDir: z.string().nullable(),
   destDirExists: z.boolean().nullable(),
   destPath: z.string().nullable(),
-  sha256: z.string().nullable(),
   sourceDeleted: z.boolean(),
   error: z.string().nullable(),
 });
@@ -398,33 +396,17 @@ function birthtimesMatch(a: Date | null, b: Date | null): boolean {
   return Math.abs(a.getTime() - b.getTime()) <= 1000;
 }
 
-/**
- * Compute the lowercase hex SHA-256 digest of a file on disk using a fixed-size
- * streaming buffer so large `.mov` screen recordings never buffer in RAM.
- */
-export async function computeSha256(filePath: string): Promise<string> {
-  const hash = createHash("sha256");
-  const file = await Deno.open(filePath, { read: true });
-  try {
-    const buffer = new Uint8Array(64 * 1024);
-    while (true) {
-      const bytesRead = await file.read(buffer);
-      if (bytesRead === null) break;
-      hash.update(buffer.subarray(0, bytesRead));
-    }
-  } finally {
-    file.close();
-  }
-  return hash.digest("hex");
-}
-
 async function runRsyncCopy(
   sourcePath: string,
   destPath: string,
+  useChecksum = false,
 ): Promise<{ ok: boolean; stderr: string }> {
+  const args = useChecksum
+    ? ["-aXN", "--checksum", "--", sourcePath, destPath]
+    : ["-aXN", "--", sourcePath, destPath];
   // swamp-quality-ignore deno-command
   const cmd = new Deno.Command("rsync", {
-    args: ["-aXN", "--", sourcePath, destPath],
+    args,
     env: SUBPROCESS_ENV,
     stdout: "piped",
     stderr: "piped",
@@ -437,17 +419,29 @@ async function runRsyncCopy(
 async function runRsyncChecksumVerify(
   sourcePath: string,
   destPath: string,
+  includeMetadata = false,
 ): Promise<{ ok: boolean; details: string }> {
-  // swamp-quality-ignore deno-command
-  const cmd = new Deno.Command("rsync", {
-    args: [
+  const args = includeMetadata
+    ? [
+      "--dry-run",
+      "-aXN",
+      "--checksum",
+      "--itemize-changes",
+      "--",
+      sourcePath,
+      destPath,
+    ]
+    : [
       "--dry-run",
       "--checksum",
       "--itemize-changes",
       "--",
       sourcePath,
       destPath,
-    ],
+    ];
+  // swamp-quality-ignore deno-command
+  const cmd = new Deno.Command("rsync", {
+    args,
     env: SUBPROCESS_ENV,
     stdout: "piped",
     stderr: "piped",
@@ -523,10 +517,10 @@ export async function checkModernRsync(
 
 /**
  * Check if an existing file in `destDir` (`filename`, `filename (1)`, ...) already
- * matches `sourcePath` by size, `rsync --checksum`, and SHA-256 hash.
+ * matches `sourcePath` by byte size and `rsync --checksum`.
  * If a byte-for-byte match is found and the destination file is missing the
- * expected extended attribute or creation timestamp, syncs via `rsync -aXN` and
- * re-verifies size, `rsync --checksum`, SHA-256, and xattrs before returning.
+ * expected extended attribute or creation timestamp, syncs metadata in place via
+ * `rsync -aXN --checksum` and re-verifies before returning.
  * Otherwise returns `{ alreadyPresent: false, destPath }` pointing to the first
  * unoccupied filename slot.
  */
@@ -536,80 +530,74 @@ async function resolveDestinationWithDeduplication(
   destDir: string,
   filename: string,
   expectedXattr: string,
-): Promise<
-  | { alreadyPresent: true; destPath: string; sha256: string }
-  | { alreadyPresent: false; destPath: string }
-> {
+): Promise<{ alreadyPresent: boolean; destPath: string }> {
   const { name: base, ext } = parse(filename);
   const sourceSizeBytes = sourceStat.size;
   let candidate = join(destDir, filename);
   let n = 1;
-  let cachedSourceSha256: string | null = null;
 
   while (await pathExists(candidate)) {
     const destStat = await Deno.stat(candidate);
     if (destStat.isFile && destStat.size === sourceSizeBytes) {
-      const rsyncCheck = await runRsyncChecksumVerify(sourcePath, candidate);
+      const rsyncCheck = await runRsyncChecksumVerify(
+        sourcePath,
+        candidate,
+        false,
+      );
       if (rsyncCheck.ok) {
-        if (!cachedSourceSha256) {
-          cachedSourceSha256 = await computeSha256(sourcePath);
-        }
-        const destSha256 = await computeSha256(candidate);
-        if (cachedSourceSha256 === destSha256) {
-          const existingXattrs = await getExtendedAttributesMap([candidate]);
-          const hasXattr = Boolean(
-            existingXattrs.get(candidate)?.has(expectedXattr),
-          );
-          const hasMatchingBirthtime = birthtimesMatch(
-            sourceStat.birthtime,
-            destStat.birthtime,
-          );
+        const existingXattrs = await getExtendedAttributesMap([candidate]);
+        const hasXattr = Boolean(
+          existingXattrs.get(candidate)?.has(expectedXattr),
+        );
+        const hasMatchingBirthtime = birthtimesMatch(
+          sourceStat.birthtime,
+          destStat.birthtime,
+        );
 
-          if (!hasXattr || !hasMatchingBirthtime) {
-            const syncResult = await runRsyncCopy(sourcePath, candidate);
-            if (!syncResult.ok) {
-              throw new Error(
-                `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
-              );
-            }
-            const recheck = await runRsyncChecksumVerify(sourcePath, candidate);
-            if (!recheck.ok) {
-              throw new Error(recheck.details);
-            }
-            const [reverifiedSha256, reverifiedStat, reverifiedXattrs] =
-              await Promise.all([
-                computeSha256(candidate),
-                Deno.stat(candidate),
-                getExtendedAttributesMap([candidate]),
-              ]);
-            if (
-              reverifiedStat.size !== sourceSizeBytes ||
-              reverifiedSha256 !== cachedSourceSha256
-            ) {
-              throw new Error(
-                `SHA-256 or size mismatch after metadata sync on existing file (src=${cachedSourceSha256}, dst=${reverifiedSha256})`,
-              );
-            }
-            if (!reverifiedXattrs.get(candidate)?.has(expectedXattr)) {
-              throw new Error(
-                `Destination file is missing expected extended attribute ${expectedXattr} after rsync -aXN: ${candidate}`,
-              );
-            }
-            if (
-              !birthtimesMatch(sourceStat.birthtime, reverifiedStat.birthtime)
-            ) {
-              throw new Error(
-                `Destination file creation timestamp mismatch after rsync -aXN: ${candidate}`,
-              );
-            }
+        if (!hasXattr || !hasMatchingBirthtime) {
+          // Use --checksum so rsync sees the file contents already match and updates
+          // xattrs (-X) and creation time (-N) in place on the existing inode.
+          const syncResult = await runRsyncCopy(sourcePath, candidate, true);
+          if (!syncResult.ok) {
+            throw new Error(
+              `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
+            );
           }
-
-          return {
-            alreadyPresent: true,
-            destPath: candidate,
-            sha256: destSha256,
-          };
+          const recheck = await runRsyncChecksumVerify(
+            sourcePath,
+            candidate,
+            true,
+          );
+          if (!recheck.ok) {
+            throw new Error(recheck.details);
+          }
+          const [reverifiedStat, reverifiedXattrs] = await Promise.all([
+            Deno.stat(candidate),
+            getExtendedAttributesMap([candidate]),
+          ]);
+          if (reverifiedStat.size !== sourceSizeBytes) {
+            throw new Error(
+              `Size mismatch after metadata sync on existing file: ${candidate}`,
+            );
+          }
+          if (!reverifiedXattrs.get(candidate)?.has(expectedXattr)) {
+            throw new Error(
+              `Destination file is missing expected extended attribute ${expectedXattr} after rsync -aXN: ${candidate}`,
+            );
+          }
+          if (
+            !birthtimesMatch(sourceStat.birthtime, reverifiedStat.birthtime)
+          ) {
+            throw new Error(
+              `Destination file creation timestamp mismatch after rsync -aXN: ${candidate}`,
+            );
+          }
         }
+
+        return {
+          alreadyPresent: true,
+          destPath: candidate,
+        };
       }
     }
     candidate = join(destDir, `${base} (${n})${ext}`);
@@ -740,7 +728,6 @@ export async function inspectAndProcess(
         destDir: null,
         destDirExists: null,
         destPath: null,
-        sha256: null,
         sourceDeleted: false,
         error: null,
       });
@@ -766,7 +753,6 @@ export async function inspectAndProcess(
         destDir,
         destDirExists: destDirExistsBefore,
         destPath: previewDestPath,
-        sha256: null,
         sourceDeleted: false,
         error: null,
       });
@@ -780,7 +766,7 @@ export async function inspectAndProcess(
       // 1. Ensure date subfolder exists
       await Deno.mkdir(destDir, { recursive: true });
 
-      // 2. Check if an identical file (by size, rsync --checksum, and SHA-256) already exists in destDir
+      // 2. Check if an identical file (by byte size and rsync --checksum) already exists in destDir
       const resolved = await resolveDestinationWithDeduplication(
         sourcePath,
         statInfo,
@@ -810,7 +796,6 @@ export async function inspectAndProcess(
           destDir,
           destDirExists: true,
           destPath: resolved.destPath,
-          sha256: resolved.sha256,
           sourceDeleted: deleteSource,
           error: null,
         });
@@ -830,26 +815,24 @@ export async function inspectAndProcess(
         await options.beforeVerify(finalDestPath);
       }
 
-      // 4. Step 2 of rsync: verify with --checksum + SHA-256 byte-for-byte comparison + xattr + birthtime presence
+      // 4. Step 2 of rsync: verify with -aXN --checksum --itemize-changes + stat + xattr presence
       const verifyResult = await runRsyncChecksumVerify(
         sourcePath,
         finalDestPath,
+        true,
       );
       if (!verifyResult.ok) {
         throw new Error(verifyResult.details);
       }
 
-      const [sourceSha256, destSha256, destStat, destXattrs] = await Promise
-        .all([
-          computeSha256(sourcePath),
-          computeSha256(finalDestPath),
-          Deno.stat(finalDestPath),
-          getExtendedAttributesMap([finalDestPath]),
-        ]);
+      const [destStat, destXattrs] = await Promise.all([
+        Deno.stat(finalDestPath),
+        getExtendedAttributesMap([finalDestPath]),
+      ]);
 
-      if (destStat.size !== sizeBytes || sourceSha256 !== destSha256) {
+      if (destStat.size !== sizeBytes) {
         throw new Error(
-          `SHA-256 or size mismatch (src=${sourceSha256}, dst=${destSha256})`,
+          `Size mismatch (src=${sizeBytes}, dst=${destStat.size})`,
         );
       }
       if (!destXattrs.get(finalDestPath)?.has(expectedXattr)) {
@@ -884,7 +867,6 @@ export async function inspectAndProcess(
         destDir,
         destDirExists: true,
         destPath: finalDestPath,
-        sha256: destSha256,
         sourceDeleted: deleteSource,
         error: null,
       });
@@ -909,7 +891,6 @@ export async function inspectAndProcess(
         destDir,
         destDirExists: destDirExistsBefore,
         destPath: attemptedDestPath ?? join(destDir, filename),
-        sha256: null,
         sourceDeleted: false,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -951,7 +932,7 @@ export const behavior = {
   resources: {
     summary: {
       description:
-        "Scan or archive summary including per-file status, destination paths, dataless detection, xattr verification, deduplication, and SHA-256 verification",
+        "Scan or archive summary including per-file status, destination paths, dataless detection, xattr verification, deduplication, and rsync checksum verification",
       schema: SummaryResourceSchema,
       lifetime: "infinite",
       garbageCollection: 30,
@@ -1067,7 +1048,7 @@ export const behavior = {
     },
     archive: {
       description:
-        "Copy eligible screenshots (< today) into configured date folders via rsync, verify with rsync --checksum and SHA-256 (deduplicating identical existing files), then optionally remove from sourceDir",
+        "Copy eligible screenshots (< today) into configured date folders via rsync -aXN, verify with rsync --checksum (deduplicating identical existing files), then optionally remove from sourceDir",
       arguments: z.object({
         dryRun: z
           .boolean()

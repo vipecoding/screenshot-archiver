@@ -2,7 +2,6 @@ import {
   behavior,
   type CandidateFile,
   checkModernRsync,
-  computeSha256,
   expandHomePath,
   formatDateSubpath,
   getExtendedAttributesMap,
@@ -341,9 +340,6 @@ Deno.test("scan and archive end-to-end with rsync checksum, xattr, and birthtime
     );
 
     const sourceShotStat = await Deno.stat(`${sourceDir}/${yesterdayShot}`);
-    const expectedShotSha = await computeSha256(
-      `${sourceDir}/${yesterdayShot}`,
-    );
 
     // 1. Read-only scan via behavior.methods.scan.execute when destRoot does NOT exist yet
     const scanWritten: SummaryResource[] = [];
@@ -431,11 +427,10 @@ Deno.test("scan and archive end-to-end with rsync checksum, xattr, and birthtime
     assertEquals(written.length, 1);
     const archivedDest = `${destRoot}/2020/11/03/${yesterdayShot}`;
     const archivedRecDest = `${destRoot}/2020/11/02/${yesterdayRec}`;
-    const destSha = await computeSha256(archivedDest);
     assertEquals(
-      destSha,
-      expectedShotSha,
-      "Destination SHA-256 must match source",
+      await Deno.readTextFile(archivedDest),
+      "png-bytes-12345",
+      "Destination content must match source",
     );
 
     const destXattrs = await getExtendedAttributesMap([archivedDest]);
@@ -509,6 +504,8 @@ Deno.test("collision suffix is added only when existing file has different conte
       `${existingDir}/${sameFilename}`,
       "identical-bytes-xyz",
     );
+    const sameInodeBefore = (await Deno.stat(`${existingDir}/${sameFilename}`))
+      .ino;
 
     // Source has a different version of diffFilename, and an identical copy of sameFilename
     await Deno.writeTextFile(
@@ -556,13 +553,20 @@ Deno.test("collision suffix is added only when existing file has different conte
     );
 
     // sameFilename did NOT create a (1) duplicate because content matched,
-    // AND its missing extended attributes were synced in place via rsync -aXN and re-verified!
+    // AND its missing extended attributes were synced in place on the existing inode via rsync -aXN --checksum!
     assertEquals(
       await fileExists(
         `${existingDir}/Screenshot 2020-11-03 at 11.00.00 AM (1).png`,
       ),
       false,
       "Identical file should be deduplicated, not duplicated as (1)",
+    );
+    const sameInodeAfter = (await Deno.stat(`${existingDir}/${sameFilename}`))
+      .ino;
+    assertEquals(
+      sameInodeAfter,
+      sameInodeBefore,
+      "Deduplicated metadata sync via rsync -aXN --checksum must update existing inode in place",
     );
     const dedupXattrs = await getExtendedAttributesMap([
       `${existingDir}/${sameFilename}`,
