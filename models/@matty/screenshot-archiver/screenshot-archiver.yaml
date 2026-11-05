@@ -1,0 +1,12 @@
+type: '@matty/screenshot-archiver'
+typeVersion: 2026.11.04.1
+id: 78032a90-ba3b-4834-8cbf-2a35d77c184c
+name: screenshot-archiver
+version: 1
+tags: {}
+globalArguments:
+  sourceDir: /Users/matthew/Desktop
+  destRoot: /Users/matthew/Library/Mobile Documents/iCloud~md~obsidian/Documents/Personal/Daily
+  dateFormat: YYYY/MM/DD
+  keepToday: true
+methods: {}
