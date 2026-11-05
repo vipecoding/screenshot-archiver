@@ -2,6 +2,7 @@ import {
   behavior,
   computeSha256,
   formatDateSubpath,
+  getExtendedAttributesMap,
   getLocalToday,
   inspectAndProcess,
   isValidDateString,
@@ -196,6 +197,13 @@ Deno.test("scan and archive end-to-end with rsync checksum and xattr verificatio
     const destSha = await computeSha256(archivedDest);
     assertEquals(destSha, expectedShotSha, "Destination SHA-256 must match source");
 
+    const destXattrs = await getExtendedAttributesMap([archivedDest]);
+    assertEquals(
+      destXattrs.get(archivedDest)?.has("com.apple.metadata:kMDItemIsScreenCapture"),
+      true,
+      "Archived screenshot must preserve kMDItemIsScreenCapture xattr via Homebrew rsync -aX",
+    );
+
     const recContent = await Deno.readTextFile(archivedRecDest);
     assertEquals(recContent, "mov-bytes-67890");
 
@@ -261,11 +269,18 @@ Deno.test("collision suffix is added only when existing file has different conte
     assertEquals(await Deno.readTextFile(`${existingDir}/${diffFilename}`), "original-file-v1");
     assertEquals(await Deno.readTextFile(collidedPath), "second-file-different-bytes");
 
-    // sameFilename did NOT create a (1) duplicate because content matched
+    // sameFilename did NOT create a (1) duplicate because content matched,
+    // AND its missing extended attributes were synced in place via rsync -aXN!
     assertEquals(
       await fileExists(`${existingDir}/Screenshot 2026-11-03 at 11.00.00 AM (1).png`),
       false,
       "Identical file should be deduplicated, not duplicated as (1)",
+    );
+    const dedupXattrs = await getExtendedAttributesMap([`${existingDir}/${sameFilename}`]);
+    assertEquals(
+      dedupXattrs.get(`${existingDir}/${sameFilename}`)?.has("com.apple.metadata:kMDItemIsScreenCapture"),
+      true,
+      "Deduplicated existing file must have its missing xattrs restored in place via rsync -aXN",
     );
     // Both source files were deleted from sourceDir
     assertEquals(await fileExists(`${sourceDir}/${diffFilename}`), false);

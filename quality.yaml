@@ -1,0 +1,4 @@
+version: 1
+accept:
+  - rule: behavior-spelling
+    reason: Targets Swamp CLI releases supporting the behavior spelling

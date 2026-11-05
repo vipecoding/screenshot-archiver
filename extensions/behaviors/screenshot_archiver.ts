@@ -11,14 +11,16 @@ import { z } from "npm:zod@4";
 const GlobalArgsSchema = z.object({
   sourceDir: z
     .string()
-    .default("/Users/matthew/Desktop")
-    .describe("Source directory containing macOS screenshots and screen recordings"),
+    .min(1)
+    .describe(
+      "Source directory containing macOS screenshots and screen recordings (e.g. '/Users/alice/Desktop')",
+    ),
   destRoot: z
     .string()
-    .default(
-      "/Users/matthew/Library/Mobile Documents/iCloud~md~obsidian/Documents/Personal/Daily",
-    )
-    .describe("Root destination directory where date subfolders live"),
+    .min(1)
+    .describe(
+      "Root destination directory where date subfolders live (e.g. '/Users/alice/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/Daily')",
+    ),
   dateFormat: z
     .string()
     .default("YYYY/MM/DD")
@@ -28,9 +30,12 @@ const GlobalArgsSchema = z.object({
   keepToday: z
     .boolean()
     .default(true)
-    .describe("Keep files whose filename date is today or later on the Desktop"),
+    .describe(
+      "Keep files whose filename date is today or later in the source directory",
+    ),
 });
 
+/** Validated global arguments for the `@matty/screenshot-archiver` behavior. */
 export type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
 const CandidateFileSchema = z.object({
@@ -59,6 +64,7 @@ const CandidateFileSchema = z.object({
   error: z.string().nullable(),
 });
 
+/** Per-file scan or archive result record. */
 export type CandidateFile = z.infer<typeof CandidateFileSchema>;
 
 const SummaryResourceSchema = z.object({
@@ -84,6 +90,9 @@ const SummaryResourceSchema = z.object({
   files: z.array(CandidateFileSchema),
 });
 
+/** Summary resource payload produced by `scan` and `archive`. */
+export type SummaryResource = z.infer<typeof SummaryResourceSchema>;
+
 const SCREENSHOT_REGEX =
   /^(Screenshot|Screen Recording)\s+(\d{4}-\d{2}-\d{2})\s+at\s+/;
 
@@ -98,6 +107,16 @@ const ALLOWED_SCREENSHOT_EXTENSIONS = new Set([
 
 const SCREENSHOT_XATTR = "com.apple.metadata:kMDItemIsScreenCapture";
 const SCREEN_RECORDING_XATTR = "com.apple.metadata:kMDItemIsScreenRecording";
+
+/**
+ * PATH prioritizing Homebrew rsync (`/opt/homebrew/opt/rsync/bin`, `/opt/homebrew/bin`,
+ * `/usr/local/bin`) ahead of `/usr/bin` so macOS's outdated `openrsync` (2.6.9) is never
+ * used when Homebrew `rsync` (3.x+) is installed.
+ */
+const SUBPROCESS_ENV = {
+  PATH:
+    "/opt/homebrew/opt/rsync/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+};
 
 /** Return today's local date formatted as YYYY-MM-DD. */
 export function getLocalToday(now: Date = new Date()): string {
@@ -126,10 +145,17 @@ export function isValidDateString(dateStr: string): boolean {
  * Format a YYYY-MM-DD date string using an Obsidian-style date folder pattern
  * supporting YYYY, YY, MM, and DD tokens.
  */
-export function formatDateSubpath(fileDate: string, dateFormat: string): string {
+export function formatDateSubpath(
+  fileDate: string,
+  dateFormat: string,
+): string {
   const trimmed = dateFormat.trim().replace(/^\/+|\/+$/g, "");
-  if (!trimmed || trimmed.split("/").some((part) => part === "." || part === "..")) {
-    throw new Error(`Invalid dateFormat '${dateFormat}': must be a relative subfolder pattern`);
+  if (
+    !trimmed || trimmed.split("/").some((part) => part === "." || part === "..")
+  ) {
+    throw new Error(
+      `Invalid dateFormat '${dateFormat}': must be a relative subfolder pattern`,
+    );
   }
   const yyyy = fileDate.slice(0, 4);
   const yy = fileDate.slice(2, 4);
@@ -182,8 +208,7 @@ export function parseScreenshotFilename(
   kind?: "screenshot" | "screen-recording";
   fileDate?: string;
 } {
-  const startsLikeCandidate =
-    filename.startsWith("Screenshot ") ||
+  const startsLikeCandidate = filename.startsWith("Screenshot ") ||
     filename.startsWith("Screen Recording ");
 
   if (!startsLikeCandidate) {
@@ -227,8 +252,10 @@ export async function getExtendedAttributesMap(
   const result = new Map<string, Set<string>>();
   if (filePaths.length === 0) return result;
 
+  // swamp-quality-ignore deno-command
   const cmd = new Deno.Command("xattr", {
     args: filePaths,
+    env: SUBPROCESS_ENV,
     stdout: "piped",
     stderr: "piped",
   });
@@ -310,8 +337,10 @@ async function runRsyncCopy(
   sourcePath: string,
   destPath: string,
 ): Promise<{ ok: boolean; stderr: string }> {
+  // swamp-quality-ignore deno-command
   const cmd = new Deno.Command("rsync", {
-    args: ["-a", "--", sourcePath, destPath],
+    args: ["-aXN", "--", sourcePath, destPath],
+    env: SUBPROCESS_ENV,
     stdout: "piped",
     stderr: "piped",
   });
@@ -324,8 +353,17 @@ async function runRsyncChecksumVerify(
   sourcePath: string,
   destPath: string,
 ): Promise<{ ok: boolean; details: string }> {
+  // swamp-quality-ignore deno-command
   const cmd = new Deno.Command("rsync", {
-    args: ["--dry-run", "--checksum", "--itemize-changes", "--", sourcePath, destPath],
+    args: [
+      "--dry-run",
+      "--checksum",
+      "--itemize-changes",
+      "--",
+      sourcePath,
+      destPath,
+    ],
+    env: SUBPROCESS_ENV,
     stdout: "piped",
     stderr: "piped",
   });
@@ -333,7 +371,10 @@ async function runRsyncChecksumVerify(
   const stdout = new TextDecoder().decode(output.stdout).trim();
   const stderr = new TextDecoder().decode(output.stderr).trim();
   if (output.code !== 0) {
-    return { ok: false, details: stderr || `rsync exited with code ${output.code}` };
+    return {
+      ok: false,
+      details: stderr || `rsync exited with code ${output.code}`,
+    };
   }
   if (stdout.length > 0) {
     return {
@@ -347,7 +388,8 @@ async function runRsyncChecksumVerify(
 /**
  * Check if an existing file in `destDir` (`filename`, `filename (1)`, ...) already
  * matches `sourcePath` by size, `rsync --checksum`, and SHA-256 hash.
- * If a byte-for-byte match is found, returns `{ alreadyPresent: true, destPath, sha256 }`.
+ * If a byte-for-byte match is found, also ensures extended attributes and creation
+ * timestamps (`rsync -aXN`) are synced onto the destination file and verified.
  * Otherwise returns `{ alreadyPresent: false, destPath }` pointing to the first
  * unoccupied filename slot.
  */
@@ -356,6 +398,7 @@ async function resolveDestinationWithDeduplication(
   sourceSizeBytes: number,
   destDir: string,
   filename: string,
+  expectedXattr: string,
 ): Promise<
   | { alreadyPresent: true; destPath: string; sha256: string }
   | { alreadyPresent: false; destPath: string }
@@ -375,6 +418,19 @@ async function resolveDestinationWithDeduplication(
         }
         const destSha256 = await computeSha256(candidate);
         if (cachedSourceSha256 === destSha256) {
+          // Ensure extended attributes (-X) and creation time (-N) are present on candidate
+          const syncResult = await runRsyncCopy(sourcePath, candidate);
+          if (!syncResult.ok) {
+            throw new Error(
+              `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
+            );
+          }
+          const destXattrs = await getExtendedAttributesMap([candidate]);
+          if (!destXattrs.get(candidate)?.has(expectedXattr)) {
+            throw new Error(
+              `Destination file is missing expected extended attribute ${expectedXattr} after rsync -aXN: ${candidate}`,
+            );
+          }
           return {
             alreadyPresent: true,
             destPath: candidate,
@@ -400,7 +456,7 @@ export async function inspectAndProcess(
     sourceDirOverride?: string;
     destRootOverride?: string;
   },
-) {
+): Promise<SummaryResource> {
   const { dateFormat = "YYYY/MM/DD", keepToday } = globalArgs;
   const sourceDir = options?.sourceDirOverride || globalArgs.sourceDir;
   const destRoot = options?.destRootOverride || globalArgs.destRoot;
@@ -471,8 +527,9 @@ export async function inspectAndProcess(
     }
 
     const { kind, fileDate } = parsed;
-    const expectedXattr =
-      kind === "screen-recording" ? SCREEN_RECORDING_XATTR : SCREENSHOT_XATTR;
+    const expectedXattr = kind === "screen-recording"
+      ? SCREEN_RECORDING_XATTR
+      : SCREENSHOT_XATTR;
     const fileXattrs = xattrMap.get(sourcePath);
     const hasScreenCaptureXattr = Boolean(fileXattrs?.has(expectedXattr));
 
@@ -550,6 +607,7 @@ export async function inspectAndProcess(
         sizeBytes,
         destDir,
         filename,
+        expectedXattr,
       );
 
       if (resolved.alreadyPresent) {
@@ -565,7 +623,9 @@ export async function inspectAndProcess(
           sizeBytes,
           dataless,
           hasScreenCaptureXattr,
-          status: deleteSource ? "archived-deduplicated" : "already-present-verified",
+          status: deleteSource
+            ? "archived-deduplicated"
+            : "already-present-verified",
           sourcePath,
           destDir,
           destDirExists: true,
@@ -579,27 +639,37 @@ export async function inspectAndProcess(
 
       const finalDestPath = resolved.destPath;
 
-      // 3. Step 1 of rsync: copy file to destination without removing source
+      // 3. Step 1 of rsync: copy file to destination with -aXN (archive + xattrs + crtimes) without removing source
       const copyResult = await runRsyncCopy(sourcePath, finalDestPath);
       if (!copyResult.ok) {
         throw new Error(`rsync copy failed: ${copyResult.stderr}`);
       }
 
-      // 4. Step 2 of rsync: verify with --checksum + SHA-256 byte-for-byte comparison
-      const verifyResult = await runRsyncChecksumVerify(sourcePath, finalDestPath);
+      // 4. Step 2 of rsync: verify with --checksum + SHA-256 byte-for-byte comparison + xattr presence
+      const verifyResult = await runRsyncChecksumVerify(
+        sourcePath,
+        finalDestPath,
+      );
       if (!verifyResult.ok) {
         throw new Error(verifyResult.details);
       }
 
-      const [sourceSha256, destSha256, destStat] = await Promise.all([
-        computeSha256(sourcePath),
-        computeSha256(finalDestPath),
-        Deno.stat(finalDestPath),
-      ]);
+      const [sourceSha256, destSha256, destStat, destXattrs] = await Promise
+        .all([
+          computeSha256(sourcePath),
+          computeSha256(finalDestPath),
+          Deno.stat(finalDestPath),
+          getExtendedAttributesMap([finalDestPath]),
+        ]);
 
       if (destStat.size !== sizeBytes || sourceSha256 !== destSha256) {
         throw new Error(
           `SHA-256 or size mismatch (src=${sourceSha256}, dst=${destSha256})`,
+        );
+      }
+      if (!destXattrs.get(finalDestPath)?.has(expectedXattr)) {
+        throw new Error(
+          `Destination file is missing expected extended attribute ${expectedXattr}: ${finalDestPath}`,
         );
       }
 
@@ -678,7 +748,7 @@ export async function inspectAndProcess(
 /** Behavior definition for archiving macOS screenshots and screen recordings. */
 export const behavior = {
   type: "@matty/screenshot-archiver",
-  version: "2026.11.04.1",
+  version: "2026.11.05.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     summary: {
@@ -689,15 +759,85 @@ export const behavior = {
       garbageCollection: 30,
     },
   },
+  checks: {
+    "valid-date-format": {
+      description:
+        "Verify dateFormat is a valid relative subfolder pattern containing date tokens",
+      labels: ["policy"],
+      execute: (context: { globalArgs: GlobalArgs }) => {
+        try {
+          formatDateSubpath("2026-11-05", context.globalArgs.dateFormat);
+          return Promise.resolve({ pass: true });
+        } catch (err) {
+          return Promise.resolve({
+            pass: false,
+            errors: [err instanceof Error ? err.message : String(err)],
+          });
+        }
+      },
+    },
+    "directories-exist": {
+      description:
+        "Verify configured sourceDir and destRoot directories exist on disk before archiving",
+      labels: ["live"],
+      appliesTo: ["archive"],
+      execute: async (context: { globalArgs: GlobalArgs }) => {
+        const errors: string[] = [];
+        if (!(await isDirectory(context.globalArgs.sourceDir))) {
+          errors.push(
+            `Source directory does not exist: ${context.globalArgs.sourceDir}`,
+          );
+        }
+        if (!(await isDirectory(context.globalArgs.destRoot))) {
+          errors.push(
+            `Destination root directory does not exist: ${context.globalArgs.destRoot}`,
+          );
+        }
+        return errors.length > 0 ? { pass: false, errors } : { pass: true };
+      },
+    },
+    "modern-rsync": {
+      description:
+        "Verify Homebrew/GNU rsync 3.x+ (with -X extended attribute support) is used rather than macOS openrsync",
+      labels: ["live"],
+      appliesTo: ["archive"],
+      execute: async () => {
+        // swamp-quality-ignore deno-command
+        const cmd = new Deno.Command("rsync", {
+          args: ["--version"],
+          env: SUBPROCESS_ENV,
+          stdout: "piped",
+          stderr: "piped",
+        });
+        const output = await cmd.output();
+        const firstLine =
+          new TextDecoder().decode(output.stdout).split("\n")[0]?.trim() ?? "";
+        if (output.code !== 0 || firstLine.startsWith("openrsync")) {
+          return {
+            pass: false,
+            errors: [
+              `Expected modern rsync 3.x+ (e.g. Homebrew 'brew install rsync'), but got: '${
+                firstLine || "none"
+              }'`,
+            ],
+          };
+        }
+        return { pass: true };
+      },
+    },
+  },
   methods: {
     scan: {
+      kind: "read",
       description:
         "Read-only scan of screenshots and screen recordings, showing target date folders without modifying any files",
       arguments: z.object({
         sourceDir: z
           .string()
           .optional()
-          .describe("Optional source directory override (e.g. /Users/matthew/Desktop/Screenshots)"),
+          .describe(
+            "Optional source directory override (e.g. '/Users/alice/Desktop/Screenshots')",
+          ),
         destRoot: z
           .string()
           .optional()
@@ -707,6 +847,9 @@ export const behavior = {
         args: { sourceDir?: string; destRoot?: string },
         context: {
           globalArgs: GlobalArgs;
+          logger?: {
+            info: (msg: string, props?: Record<string, unknown>) => void;
+          };
           writeResource: (
             specName: string,
             instanceName: string,
@@ -714,6 +857,11 @@ export const behavior = {
           ) => Promise<{ name: string }>;
         },
       ) => {
+        const effectiveSourceDir = args.sourceDir ||
+          context.globalArgs.sourceDir;
+        context.logger?.info("Scanning screenshots in {sourceDir}", {
+          sourceDir: effectiveSourceDir,
+        });
         const result = await inspectAndProcess(
           context.globalArgs,
           "scan",
@@ -724,6 +872,14 @@ export const behavior = {
           },
         );
         const handle = await context.writeResource("summary", "main", result);
+        context.logger?.info(
+          "Scan completed: {eligibleCount} eligible of {scannedCount} scanned",
+          {
+            scannedCount: result.scannedCount,
+            matchedCount: result.matchedCount,
+            eligibleCount: result.eligibleCount,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -734,7 +890,9 @@ export const behavior = {
         dryRun: z
           .boolean()
           .default(false)
-          .describe("When true, preview archive actions without creating folders or moving files"),
+          .describe(
+            "When true, preview archive actions without creating folders or moving files",
+          ),
         deleteSource: z
           .boolean()
           .default(true)
@@ -745,12 +903,14 @@ export const behavior = {
           .string()
           .optional()
           .describe(
-            "Optional source directory override (e.g. /Users/matthew/Desktop/Screenshots); files are scanned and removed from this directory",
+            "Optional source directory override (e.g. '/Users/alice/Desktop/Screenshots'); files are scanned and removed from this directory",
           ),
         destRoot: z
           .string()
           .optional()
-          .describe("Optional destination root directory override (useful for testing to a temporary folder)"),
+          .describe(
+            "Optional destination root directory override (useful for testing to a temporary folder)",
+          ),
       }),
       execute: async (
         args: {
@@ -761,6 +921,10 @@ export const behavior = {
         },
         context: {
           globalArgs: GlobalArgs;
+          logger?: {
+            info: (msg: string, props?: Record<string, unknown>) => void;
+            error: (msg: string, props?: Record<string, unknown>) => void;
+          };
           writeResource: (
             specName: string,
             instanceName: string,
@@ -769,6 +933,13 @@ export const behavior = {
         },
       ) => {
         const mode = args.dryRun ? "dry-run" : "archive";
+        const effectiveSourceDir = args.sourceDir ||
+          context.globalArgs.sourceDir;
+        context.logger?.info("Running screenshot {mode} on {sourceDir}", {
+          mode,
+          sourceDir: effectiveSourceDir,
+          deleteSource: args.deleteSource ?? true,
+        });
         const result = await inspectAndProcess(
           context.globalArgs,
           mode,
@@ -779,12 +950,27 @@ export const behavior = {
             destRootOverride: args.destRoot,
           },
         );
-        const handle = await context.writeResource("summary", "main", result);
         if (result.errorCount > 0) {
+          context.logger?.error(
+            "Archive encountered {errorCount} verification or copy error(s) in {sourceDir}",
+            {
+              errorCount: result.errorCount,
+              sourceDir: result.sourceDir,
+            },
+          );
           throw new Error(
             `Archive completed with ${result.errorCount} verification or copy error(s); unverified source files were kept in ${result.sourceDir}.`,
           );
         }
+        const handle = await context.writeResource("summary", "main", result);
+        context.logger?.info(
+          "Archive completed: {archivedCount} archived ({copiedVerifiedCount} copied, {deduplicatedCount} deduplicated)",
+          {
+            archivedCount: result.archivedCount,
+            copiedVerifiedCount: result.copiedVerifiedCount,
+            deduplicatedCount: result.deduplicatedCount,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
