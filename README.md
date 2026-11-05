@@ -45,8 +45,8 @@ Configured on the behavior instance in `models/@matty/screenshot-archiver/<name>
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `sourceDir` | `string` | *(required)* | Source directory containing macOS screenshots and screen recordings (e.g. `/Users/alice/Desktop`). |
-| `destRoot` | `string` | *(required)* | Root destination directory where date subfolders live (e.g. `/Users/alice/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/Daily`). |
+| `sourceDir` | `string` | *(required)* | Source directory containing macOS screenshots and screen recordings (e.g. `~/Desktop` or `/Users/alice/Desktop`). |
+| `destRoot` | `string` | *(required)* | Root destination directory where date subfolders live (e.g. `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/Daily`). |
 | `dateFormat` | `string` | `"YYYY/MM/DD"` | Relative subfolder pattern using `YYYY`, `YY`, `MM`, `DD` tokens (e.g. `YYYY/MM/DD`, `YYYY-MM-DD`, `YYYY/MM/YYYY-MM-DD`). |
 | `keepToday` | `boolean` | `true` | When `true`, screenshots dated today (or later) remain in `sourceDir` and only files from earlier dates (`< today`) are archived. |
 

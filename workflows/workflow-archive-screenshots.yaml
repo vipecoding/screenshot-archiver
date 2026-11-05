@@ -22,6 +22,9 @@ jobs:
         allowFailure: false
       - name: archive
         description: Copy eligible files via rsync, verify checksum + SHA-256, and remove from Desktop
+        # In Swamp workflows, a truthy guard skips the step ("guarded").
+        # Skip archive when scan found 0 eligible files (run archive only when eligibleCount > 0).
+        guard: ${{ data.latest("screenshot-archiver", "main").attributes.eligibleCount == 0 }}
         task:
           type: behavior
           behavior: screenshot-archiver
