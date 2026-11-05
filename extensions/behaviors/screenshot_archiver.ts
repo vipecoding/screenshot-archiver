@@ -530,6 +530,7 @@ async function resolveDestinationWithDeduplication(
   destDir: string,
   filename: string,
   expectedXattr: string,
+  syncMetadata = true,
 ): Promise<{ alreadyPresent: boolean; destPath: string }> {
   const { name: base, ext } = parse(filename);
   const sourceSizeBytes = sourceStat.size;
@@ -545,52 +546,54 @@ async function resolveDestinationWithDeduplication(
         false,
       );
       if (rsyncCheck.ok) {
-        const existingXattrs = await getExtendedAttributesMap([candidate]);
-        const hasXattr = Boolean(
-          existingXattrs.get(candidate)?.has(expectedXattr),
-        );
-        const hasMatchingBirthtime = birthtimesMatch(
-          sourceStat.birthtime,
-          destStat.birthtime,
-        );
-
-        if (!hasXattr || !hasMatchingBirthtime) {
-          // Use --checksum so rsync sees the file contents already match and updates
-          // xattrs (-X) and creation time (-N) in place on the existing inode.
-          const syncResult = await runRsyncCopy(sourcePath, candidate, true);
-          if (!syncResult.ok) {
-            throw new Error(
-              `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
-            );
-          }
-          const recheck = await runRsyncChecksumVerify(
-            sourcePath,
-            candidate,
-            true,
+        if (syncMetadata) {
+          const existingXattrs = await getExtendedAttributesMap([candidate]);
+          const hasXattr = Boolean(
+            existingXattrs.get(candidate)?.has(expectedXattr),
           );
-          if (!recheck.ok) {
-            throw new Error(recheck.details);
-          }
-          const [reverifiedStat, reverifiedXattrs] = await Promise.all([
-            Deno.stat(candidate),
-            getExtendedAttributesMap([candidate]),
-          ]);
-          if (reverifiedStat.size !== sourceSizeBytes) {
-            throw new Error(
-              `Size mismatch after metadata sync on existing file: ${candidate}`,
+          const hasMatchingBirthtime = birthtimesMatch(
+            sourceStat.birthtime,
+            destStat.birthtime,
+          );
+
+          if (!hasXattr || !hasMatchingBirthtime) {
+            // Use --checksum so rsync sees the file contents already match and updates
+            // xattrs (-X) and creation time (-N) in place on the existing inode.
+            const syncResult = await runRsyncCopy(sourcePath, candidate, true);
+            if (!syncResult.ok) {
+              throw new Error(
+                `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
+              );
+            }
+            const recheck = await runRsyncChecksumVerify(
+              sourcePath,
+              candidate,
+              true,
             );
-          }
-          if (!reverifiedXattrs.get(candidate)?.has(expectedXattr)) {
-            throw new Error(
-              `Destination file is missing expected extended attribute ${expectedXattr} after rsync -aXN: ${candidate}`,
-            );
-          }
-          if (
-            !birthtimesMatch(sourceStat.birthtime, reverifiedStat.birthtime)
-          ) {
-            throw new Error(
-              `Destination file creation timestamp mismatch after rsync -aXN: ${candidate}`,
-            );
+            if (!recheck.ok) {
+              throw new Error(recheck.details);
+            }
+            const [reverifiedStat, reverifiedXattrs] = await Promise.all([
+              Deno.stat(candidate),
+              getExtendedAttributesMap([candidate]),
+            ]);
+            if (reverifiedStat.size !== sourceSizeBytes) {
+              throw new Error(
+                `Size mismatch after metadata sync on existing file: ${candidate}`,
+              );
+            }
+            if (!reverifiedXattrs.get(candidate)?.has(expectedXattr)) {
+              throw new Error(
+                `Destination file is missing expected extended attribute ${expectedXattr} after rsync -aXN: ${candidate}`,
+              );
+            }
+            if (
+              !birthtimesMatch(sourceStat.birthtime, reverifiedStat.birthtime)
+            ) {
+              throw new Error(
+                `Destination file creation timestamp mismatch after rsync -aXN: ${candidate}`,
+              );
+            }
           }
         }
 
@@ -740,7 +743,19 @@ export async function inspectAndProcess(
     const destDirExistsBefore = await isDirectory(destDir);
 
     if (mode === "scan" || mode === "dry-run") {
-      const previewDestPath = join(destDir, filename);
+      const resolved = destDirExistsBefore
+        ? await resolveDestinationWithDeduplication(
+          sourcePath,
+          statInfo,
+          destDir,
+          filename,
+          expectedXattr,
+          false,
+        )
+        : { alreadyPresent: false, destPath: join(destDir, filename) };
+      if (resolved.alreadyPresent) {
+        deduplicatedCount += 1;
+      }
       files.push({
         filename,
         kind,
@@ -752,7 +767,7 @@ export async function inspectAndProcess(
         sourcePath,
         destDir,
         destDirExists: destDirExistsBefore,
-        destPath: previewDestPath,
+        destPath: resolved.destPath,
         sourceDeleted: false,
         error: null,
       });

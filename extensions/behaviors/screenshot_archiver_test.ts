@@ -525,6 +525,30 @@ Deno.test("collision suffix is added only when existing file has different conte
       "com.apple.metadata:kMDItemIsScreenCapture",
     );
 
+    // Pre-check: scan previews collision suffix (1) and deduplication without modifying disk
+    const scanPreview = await inspectAndProcess(
+      {
+        sourceDir,
+        destRoot,
+        dateFormat: "YYYY/MM/DD",
+        keepToday: true,
+      },
+      "scan",
+      "2020-11-04",
+    );
+    assertEquals(scanPreview.deduplicatedCount, 1);
+    const previewDiff = scanPreview.files.find(
+      (f: CandidateFile) => f.filename === diffFilename,
+    );
+    const previewSame = scanPreview.files.find(
+      (f: CandidateFile) => f.filename === sameFilename,
+    );
+    assertEquals(
+      previewDiff?.destPath,
+      `${existingDir}/Screenshot 2020-11-03 at 10.00.00 AM (1).png`,
+    );
+    assertEquals(previewSame?.destPath, `${existingDir}/${sameFilename}`);
+
     const result = await inspectAndProcess(
       {
         sourceDir,
