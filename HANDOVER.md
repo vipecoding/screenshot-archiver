@@ -48,10 +48,10 @@ screenshot-archiver/
 ### 3. Nightly Audit Trail (`src/audit.ts`)
 - **Human-Readable Log (`logs/archive.log`):**
   - Appends a clean, timestamped summary header and per-file lines (`ARCHIVED`, `DEDUPLICATED`, `ERROR`) for each run/batch.
-  - Auto-rotates (`archive.log.1`) when file size exceeds 5 MB.
+  - Auto-rotates (`archive.log.1`, keeping up to 3 rotated files) only when file size exceeds **50 MB** (~410,000 screenshots / ~115 years at 10 screenshots/day).
 - **Structured JSONL Log (`logs/audit.jsonl`):**
-  - Appends one JSON line per run/batch with full metadata (run ID, timestamps, counts, and per-file source/dest paths, sizes, and errors).
-  - Auto-rotates (`audit.jsonl.1`) when file size exceeds 10 MB.
+  - Appends one JSON line per run/batch with full metadata (run ID, timestamps, counts, and per-file source/dest paths, sizes, and errors) to power `screenshot-archiver history`.
+  - Auto-rotates (`audit.jsonl.1`, keeping up to 3 rotated files) only when file size exceeds **50 MB** (~150,000 screenshots / ~40 years at 10 screenshots/day).
 - **Built-in CLI History Viewer (`screenshot-archiver history`):**
   - Displays recent runs and moved/failed files from `logs/audit.jsonl` (supports `--errors` and `--limit N`).
 - **macOS Notification on Error:**
