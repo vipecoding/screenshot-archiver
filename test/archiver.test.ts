@@ -18,8 +18,6 @@ import {
   normalizeScreenshotDate,
   parseScreenshotFilename,
   SUBPROCESS_ENV,
-  validateDateFormat,
-  validateDirectories,
 } from "../src/archiver.ts";
 import {
   appendBatchAudit,
@@ -279,33 +277,15 @@ describe("screenshot-archiver", () => {
     }
   });
 
-  test("validateDateFormat, validateDirectories, and checkModernRsync validate environment", async () => {
-    const tempRoot = await makeTempTestDir("screenshot-checks-test-");
-    try {
-      expect(validateDateFormat("YYYY/MM/DD").pass).toBe(true);
-      expect(validateDateFormat("yyyy/mm/dd").pass).toBe(false);
+  test("checkModernRsync validates Homebrew rsync 3.x+ capabilities", async () => {
+    const modernRsyncPass = await checkModernRsync();
+    expect(modernRsyncPass.pass).toBe(true);
 
-      const dirsExist = await validateDirectories(tempRoot, tempRoot);
-      expect(dirsExist.pass).toBe(true);
+    const openRsyncFail = await checkModernRsync({ PATH: "/usr/bin:/bin" });
+    expect(openRsyncFail.pass).toBe(false);
 
-      const dirsMissing = await validateDirectories(
-        `${tempRoot}/missing-src`,
-        `${tempRoot}/missing-dst`,
-      );
-      expect(dirsMissing.pass).toBe(false);
-      expect(dirsMissing.errors?.length).toBe(2);
-
-      const modernRsyncPass = await checkModernRsync();
-      expect(modernRsyncPass.pass).toBe(true);
-
-      const openRsyncFail = await checkModernRsync({ PATH: "/usr/bin:/bin" });
-      expect(openRsyncFail.pass).toBe(false);
-
-      const missingRsyncFail = await checkModernRsync({ PATH: "/nonexistent" });
-      expect(missingRsyncFail.pass).toBe(false);
-    } finally {
-      await rm(tempRoot, { recursive: true, force: true });
-    }
+    const missingRsyncFail = await checkModernRsync({ PATH: "/nonexistent" });
+    expect(missingRsyncFail.pass).toBe(false);
   });
 
   test("scan, dry-run, and archive end-to-end with rsync checksum, xattr, and birthtime verification", async () => {
@@ -704,16 +684,13 @@ describe("screenshot-archiver", () => {
 
       await inspectAndProcess(
         {
-          sourceDir: defaultDesktop,
+          sourceDir: subfolderSource,
           destRoot,
           dateFormat: "YYYY/MM/DD",
           keepToday: true,
         },
         "archive",
         "2020-11-04",
-        {
-          sourceDirOverride: subfolderSource,
-        },
       );
 
       expect(
@@ -752,7 +729,7 @@ describe("screenshot-archiver", () => {
       const summary = await inspectAndProcess(
         {
           sourceDir,
-          destRoot: realDest,
+          destRoot: tempDest,
           dateFormat: "YYYY/MM/DD",
           keepToday: true,
         },
@@ -760,7 +737,6 @@ describe("screenshot-archiver", () => {
         "2020-11-04",
         {
           deleteSource: false,
-          destRootOverride: tempDest,
         },
       );
 
@@ -805,7 +781,7 @@ describe("screenshot-archiver", () => {
       }
 
       // Direct unit check on createArchivePlan:
-      // Single day with 2 files and batchSize=50 -> single-day strategy, 1 batch
+      // Single day with 2 files and batchSize=50 -> 1 day, 1 batch
       const singleDayPlan = createArchivePlan(
         [
           {
@@ -821,7 +797,6 @@ describe("screenshot-archiver", () => {
         ],
         50,
       );
-      expect(singleDayPlan.strategy).toBe("single-day");
       expect(singleDayPlan.dayCount).toBe(1);
       expect(singleDayPlan.batchCount).toBe(1);
 

@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY_PATH="$REPO_ROOT/bin/screenshot-archiver"
+RUNNER_TEMPLATE="$REPO_ROOT/runner/ScreenshotArchiverRunner.applescript"
 
 SYSTEM_APP_PATH="/Applications/ScreenshotArchiverRunner.app"
 USER_APP_PATH="$HOME/Applications/ScreenshotArchiverRunner.app"
@@ -55,6 +56,10 @@ if [[ "$APP_PATH" != *.app ]]; then
   exit 2
 fi
 
+if [[ ! -x "$BINARY_PATH" ]]; then
+  printf "WARNING: CLI binary not found or not executable at %s (run 'bun run build' first)\n" "$BINARY_PATH" >&2
+fi
+
 APP_PARENT="$(dirname "$APP_PATH")"
 if ! mkdir -p "$APP_PARENT"; then
   printf "Cannot create app parent directory: %s\n" "$APP_PARENT" >&2
@@ -69,20 +74,19 @@ if [[ -e "$APP_PATH" ]] && ! rm -rf "$APP_PATH"; then
   exit 1
 fi
 
-TMP_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/ScreenshotArchiverRunner.XXXXXX.applescript")"
-trap 'rm -f "$TMP_SCRIPT"' EXIT
-
-cat > "$TMP_SCRIPT" <<EOF
+ESCAPED_BINARY_PATH="${BINARY_PATH//\'/\'\\\'\'}"
+cat > "$RUNNER_TEMPLATE" <<EOF
 on run
   try
-    do shell script "$BINARY_PATH archive"
+    do shell script "'$ESCAPED_BINARY_PATH' archive"
   on error errMsg number errNum
-    -- Errors are logged to logs/archive.log + logs/audit.jsonl and notified via Notification Center.
+    -- Errors are recorded to logs/archive.log + logs/audit.jsonl and surfaced via Notification Center.
+    -- Catching here prevents the GUI applet from blocking launchd with a modal dialog.
   end try
 end run
 EOF
 
-osacompile -o "$APP_PATH" "$TMP_SCRIPT"
+osacompile -o "$APP_PATH" "$RUNNER_TEMPLATE"
 
 EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/applet"
 printf "Built runner app: %s\n" "$APP_PATH"

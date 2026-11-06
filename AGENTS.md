@@ -4,9 +4,9 @@ Standalone, zero-dependency TypeScript macOS CLI tool compiled to a native binar
 
 ## Architecture & Rules
 
-1. **Zero external runtime dependencies.** Use only standard `node:fs/promises`, `node:path`, `node:child_process`, and `node:util` APIs so `src/` runs natively in both Bun and Node.js 24+.
-2. **Verified two-step transfer (`rsync -aXN` + `--checksum` + `xattr`).** Every screenshot (`com.apple.metadata:kMDItemIsScreenCapture`) and screen recording (`com.apple.metadata:kMDItemIsScreenRecording`) is verified via extended attributes before and after transfer, and source files are only deleted after `rsync --dry-run -aXN --checksum --itemize-changes` and `xattr` verification succeed.
-3. **Chunked batching & bounded concurrency.** Process files in batches (`batchSize = 50`, `concurrency = 4`), deduplicating `mkdir` calls, batching destination `xattr` verification, and flushing audit logs (`logs/archive.log` and `logs/audit.jsonl`) after every batch.
+1. **Zero external runtime dependencies.** Use only standard `node:fs/promises`, `node:path`, `node:child_process`, `node:crypto`, and `node:util` APIs so `src/` runs natively in both Bun and Node.js 24+.
+2. **Verified two-step transfer (`rsync -aXN` + `--checksum` + `xattr`).** Every screenshot (`com.apple.metadata:kMDItemIsScreenCapture`) and screen recording (`com.apple.metadata:kMDItemIsScreenRecording`) is verified via extended attributes before and after transfer, and source files are only deleted after `rsync --dry-run -aN --checksum --itemize-changes` and `xattr` verification succeed.
+3. **Day-by-day planning & bounded concurrency.** Group eligible files by date (`YYYY-MM-DD`) via `createArchivePlan`, sub-batching only when a day exceeds `batchSize = 50`, processing up to `concurrency = 4` files in parallel per batch, deduplicating `mkdir` per day, and flushing audit logs (`logs/archive.log` and `logs/audit.jsonl`) after every batch.
 4. **Build & Test.**
    - Run tests: `bun test`
    - Compile binary: `bun run build` (`bun build --compile src/cli.ts --outfile bin/screenshot-archiver`)

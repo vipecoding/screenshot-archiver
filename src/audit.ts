@@ -11,6 +11,7 @@ import {
   DEFAULT_SCREENSHOT_PREFIX,
   execSubprocess,
   expandHomePath,
+  getLocalToday,
   SUBPROCESS_ENV,
   type SummaryResource,
 } from "./archiver.ts";
@@ -358,7 +359,7 @@ export async function appendFatalAuditError(
     recordType: "run",
     runId: params.runId,
     timestamp,
-    today: timestamp.slice(0, 10),
+    today: getLocalToday(),
     mode: params.mode,
     deleteSource: false,
     sourceDir: params.sourceDir,
@@ -481,7 +482,34 @@ export async function readAuditHistory(
   for (const runId of runOrder) {
     const entry = runMap.get(runId)!;
     if (entry.run) {
-      runs.push(entry.run);
+      if (entry.batches.length > 0 && entry.run.files.length === 0) {
+        const combinedFiles: AuditFileRecord[] = [];
+        const uniqueDays = new Set<string>();
+        let copiedVerifiedCount = 0;
+        let deduplicatedCount = 0;
+        let archivedCount = 0;
+        let batchErrors = 0;
+        for (const b of entry.batches) {
+          if (b.fileDate) uniqueDays.add(b.fileDate);
+          copiedVerifiedCount += b.copiedVerifiedCount;
+          deduplicatedCount += b.deduplicatedCount;
+          archivedCount += b.archivedCount;
+          batchErrors += b.errorCount;
+          combinedFiles.push(...b.files);
+        }
+        runs.push({
+          ...entry.run,
+          dayCount: uniqueDays.size || entry.run.dayCount,
+          batchCount: entry.batches.length,
+          copiedVerifiedCount,
+          deduplicatedCount,
+          archivedCount,
+          errorCount: entry.run.errorCount + batchErrors,
+          files: combinedFiles,
+        });
+      } else {
+        runs.push(entry.run);
+      }
       continue;
     }
     if (entry.batches.length > 0) {
@@ -505,7 +533,7 @@ export async function readAuditHistory(
         recordType: "run",
         runId,
         timestamp: last.timestamp,
-        today: last.timestamp.slice(0, 10),
+        today: getLocalToday(new Date(last.timestamp)),
         mode: first.mode,
         deleteSource: first.mode === "archive",
         sourceDir: first.sourceDir,

@@ -8,7 +8,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { mkdir, readdir, rm, stat, unlink } from "node:fs/promises";
+import { lstat, mkdir, readdir, rm, stat, unlink } from "node:fs/promises";
 import { join, parse } from "node:path";
 
 export const DEFAULT_SOURCE_DIR = "~/Desktop";
@@ -101,9 +101,6 @@ export interface SummaryResource {
 
 export interface InspectAndProcessOptions {
   deleteSource?: boolean;
-  sourceDirOverride?: string;
-  destRootOverride?: string;
-  screenshotPrefixOverride?: string;
   batchSize?: number;
   concurrency?: number;
   runId?: string;
@@ -131,13 +128,11 @@ export interface ArchivePlan<T = EligibleCandidate> {
   dayCount: number;
   batchCount: number;
   batchSize: number;
-  strategy: "empty" | "single-day" | "multi-day";
   days: DayPlan<T>[];
 }
 
-export const SCREENSHOT_XATTR = "com.apple.metadata:kMDItemIsScreenCapture";
-export const SCREEN_RECORDING_XATTR =
-  "com.apple.metadata:kMDItemIsScreenRecording";
+const SCREENSHOT_XATTR = "com.apple.metadata:kMDItemIsScreenCapture";
+const SCREEN_RECORDING_XATTR = "com.apple.metadata:kMDItemIsScreenRecording";
 const XATTR_BATCH_SIZE = 200;
 
 const SCREEN_RECORDING_FULL_REGEX =
@@ -188,7 +183,7 @@ export const SUBPROCESS_ENV: Record<string, string> = {
   PATH: buildSubprocessPath(),
 };
 
-export interface SubprocessResult {
+interface SubprocessResult {
   code: number;
   stdout: string;
   stderr: string;
@@ -419,6 +414,7 @@ export function parseScreenshotFilename(
 export async function getExtendedAttributesMap(
   filePaths: string[],
   batchSize: number = XATTR_BATCH_SIZE,
+  ignoreMissing = false,
 ): Promise<Map<string, Set<string>>> {
   const result = new Map<string, Set<string>>();
   if (filePaths.length === 0) return result;
@@ -441,13 +437,20 @@ export async function getExtendedAttributesMap(
       if (batch.length > 1) {
         for (const singlePath of batch) {
           try {
-            const singleMap = await getExtendedAttributesMap([singlePath], 1);
+            const singleMap = await getExtendedAttributesMap(
+              [singlePath],
+              1,
+              true,
+            );
             const attrs = singleMap.get(singlePath);
             if (attrs) result.set(singlePath, attrs);
           } catch {
             // Ignore vanished file in multi-file batch
           }
         }
+        continue;
+      }
+      if (ignoreMissing) {
         continue;
       }
       const stderr = output.stderr.trim();
@@ -483,7 +486,7 @@ export async function getExtendedAttributesMap(
   return result;
 }
 
-export async function isDirectory(p: string): Promise<boolean> {
+async function isDirectory(p: string): Promise<boolean> {
   try {
     const info = await stat(p);
     return info.isDirectory();
@@ -565,10 +568,10 @@ async function verifyCopiedFile(
     throw new Error(verifyResult.details);
   }
   const [destStat, destXattrs] = await Promise.all([
-    stat(destPath),
+    lstat(destPath),
     getExtendedAttributesMap([destPath]),
   ]);
-  if (destStat.size !== sourceStat.size) {
+  if (!destStat.isFile() || destStat.size !== sourceStat.size) {
     throw new Error(
       `Size mismatch (src=${sourceStat.size}, dst=${destStat.size})`,
     );
@@ -625,37 +628,6 @@ export async function checkModernRsync(
   return { pass: true };
 }
 
-export function validateDateFormat(dateFormat: string): {
-  pass: boolean;
-  errors?: string[];
-} {
-  try {
-    formatDateSubpath("2026-11-05", dateFormat);
-    return { pass: true };
-  } catch (err) {
-    return {
-      pass: false,
-      errors: [err instanceof Error ? err.message : String(err)],
-    };
-  }
-}
-
-export async function validateDirectories(
-  sourceDirInput: string,
-  destRootInput: string,
-): Promise<{ pass: boolean; errors?: string[] }> {
-  const errors: string[] = [];
-  const sourceDir = expandHomePath(sourceDirInput);
-  const destRoot = expandHomePath(destRootInput);
-  if (!(await isDirectory(sourceDir))) {
-    errors.push(`Source directory does not exist: ${sourceDir}`);
-  }
-  if (!(await isDirectory(destRoot))) {
-    errors.push(`Destination root directory does not exist: ${destRoot}`);
-  }
-  return errors.length > 0 ? { pass: false, errors } : { pass: true };
-}
-
 /**
  * Resolve destination path with content-checksum deduplication and concurrency-safe
  * `(1)` slot reservation.
@@ -677,21 +649,28 @@ async function resolveDestinationWithDeduplication(
 
   while (true) {
     const candidateKey = normalizeApfsPathKey(candidate);
+    if (reservedDestPaths.has(candidateKey)) {
+      candidate = join(destDir, `${base} (${n})${ext}`);
+      n += 1;
+      continue;
+    }
+
     let destStat: Stats | null = null;
     try {
-      destStat = await stat(candidate);
+      destStat = await lstat(candidate);
     } catch {
       destStat = null;
     }
 
-    if (!destStat) {
-      if (!reservedDestPaths.has(candidateKey)) {
-        reservedDestPaths.add(candidateKey);
-        return { alreadyPresent: false, destPath: candidate };
-      }
+    if (reservedDestPaths.has(candidateKey)) {
       candidate = join(destDir, `${base} (${n})${ext}`);
       n += 1;
       continue;
+    }
+
+    if (!destStat) {
+      reservedDestPaths.add(candidateKey);
+      return { alreadyPresent: false, destPath: candidate };
     }
 
     if (destStat.isFile() && destStat.size === sourceSizeBytes) {
@@ -703,40 +682,52 @@ async function resolveDestinationWithDeduplication(
         continue;
       }
 
-      const rsyncCheck = await runRsyncChecksumVerify(
-        sourcePath,
-        candidate,
-        false,
-      );
-      if (rsyncCheck.ok) {
-        if (syncMetadata) {
-          const existingXattrs = await getExtendedAttributesMap([candidate]);
-          const hasXattr = Boolean(
-            existingXattrs.get(candidate)?.has(expectedXattr),
-          );
-          const hasMatchingBirthtime = birthtimesMatch(
-            sourceStat.birthtime,
-            destStat.birthtime,
-          );
+      // Reserve this candidate while checking checksum / syncing metadata so no
+      // concurrent worker can collide on the same existing file.
+      reservedDestPaths.add(candidateKey);
+      try {
+        const rsyncCheck = await runRsyncChecksumVerify(
+          sourcePath,
+          candidate,
+          false,
+        );
+        if (rsyncCheck.ok) {
+          if (syncMetadata) {
+            const existingXattrs = await getExtendedAttributesMap([candidate]);
+            const hasXattr = Boolean(
+              existingXattrs.get(candidate)?.has(expectedXattr),
+            );
+            const hasMatchingBirthtime = birthtimesMatch(
+              sourceStat.birthtime,
+              destStat.birthtime,
+            );
 
-          if (!hasXattr || !hasMatchingBirthtime) {
-            const syncResult = await runRsyncCopy(sourcePath, candidate, true);
-            if (!syncResult.ok) {
-              throw new Error(
-                `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
+            if (!hasXattr || !hasMatchingBirthtime) {
+              const syncResult = await runRsyncCopy(
+                sourcePath,
+                candidate,
+                true,
+              );
+              if (!syncResult.ok) {
+                throw new Error(
+                  `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
+                );
+              }
+              await verifyCopiedFile(
+                sourcePath,
+                sourceStat,
+                candidate,
+                expectedXattr,
               );
             }
-            await verifyCopiedFile(
-              sourcePath,
-              sourceStat,
-              candidate,
-              expectedXattr,
-            );
           }
-        }
 
-        reservedDestPaths.add(candidateKey);
-        return { alreadyPresent: true, destPath: candidate };
+          return { alreadyPresent: true, destPath: candidate };
+        }
+        reservedDestPaths.delete(candidateKey);
+      } catch (err) {
+        reservedDestPaths.delete(candidateKey);
+        throw err;
       }
     }
 
@@ -745,7 +736,7 @@ async function resolveDestinationWithDeduplication(
   }
 }
 
-export async function mapWithConcurrency<T, R>(
+async function mapWithConcurrency<T, R>(
   items: readonly T[],
   concurrency: number,
   worker: (item: T, index: number) => Promise<R>,
@@ -773,7 +764,7 @@ export async function mapWithConcurrency<T, R>(
   return results;
 }
 
-export interface EligibleCandidate {
+interface EligibleCandidate {
   filename: string;
   sourcePath: string;
   kind: "screenshot" | "screen-recording";
@@ -877,19 +868,11 @@ export function createArchivePlan<
     });
   }
 
-  const strategy: ArchivePlan<T>["strategy"] =
-    days.length === 0
-      ? "empty"
-      : days.length === 1
-        ? "single-day"
-        : "multi-day";
-
   return {
     totalFiles: candidates.length,
     dayCount: days.length,
     batchCount: totalBatches,
     batchSize: effectiveBatchSize,
-    strategy,
     days,
   };
 }
@@ -998,15 +981,9 @@ export async function inspectAndProcess(
   const dateFormat = globalArgs.dateFormat ?? DEFAULT_DATE_FORMAT;
   const keepToday = globalArgs.keepToday ?? DEFAULT_KEEP_TODAY;
   const screenshotPrefix =
-    options?.screenshotPrefixOverride ||
-    globalArgs.screenshotPrefix ||
-    DEFAULT_SCREENSHOT_PREFIX;
-  const sourceDir = expandHomePath(
-    options?.sourceDirOverride || globalArgs.sourceDir,
-  );
-  const destRoot = expandHomePath(
-    options?.destRootOverride || globalArgs.destRoot,
-  );
+    globalArgs.screenshotPrefix || DEFAULT_SCREENSHOT_PREFIX;
+  const sourceDir = expandHomePath(globalArgs.sourceDir);
+  const destRoot = expandHomePath(globalArgs.destRoot);
   const deleteSource = options?.deleteSource ?? true;
   const batchSize = Math.max(
     1,
@@ -1091,6 +1068,8 @@ export async function inspectAndProcess(
 
   const xattrMap = await getExtendedAttributesMap(
     parsedCandidates.map((c) => c.sourcePath),
+    XATTR_BATCH_SIZE,
+    true,
   );
 
   const destDirExistenceCache = new Map<string, boolean>();
@@ -1183,10 +1162,9 @@ export async function inspectAndProcess(
   // Stage 3: Execute Plan Day-by-Day
   // ============================================================================
   let globalBatchIndex = 0;
+  const reservedDestPaths = new Set<string>();
 
   for (const dayPlan of plan.days) {
-    const reservedDestPaths = new Set<string>();
-
     if (mode === "scan" || mode === "dry-run") {
       for (const batch of dayPlan.batches) {
         globalBatchIndex += 1;
@@ -1194,14 +1172,6 @@ export async function inspectAndProcess(
           batch,
           concurrency,
           async (item) => {
-            if (!item.destDirExistsBefore) {
-              const candidate = join(item.destDir, item.filename);
-              reservedDestPaths.add(normalizeApfsPathKey(candidate));
-              return {
-                item,
-                resolved: { alreadyPresent: false, destPath: candidate },
-              };
-            }
             const resolved = await resolveDestinationWithDeduplication(
               item.sourcePath,
               item.statInfo,

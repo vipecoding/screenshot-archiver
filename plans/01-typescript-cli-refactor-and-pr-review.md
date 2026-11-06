@@ -37,14 +37,10 @@ Instead of flattening all eligible files across all dates and slicing them into 
    - Record `dayCount` and `batchCount` in `SummaryResource` and `AuditRunRecord`.
 3. **Phase 3 — Execute Plan Day-by-Day:**
    - **Single `mkdir` per day:** Ensure `<destRoot>/<dateSubpath>` exists once per `DayPlan`.
-   - **Pre-inspect destination directory once per day-batch:** Read existing entries in `destDir`.
-   - **Fast Multi-File `rsync` Path (No Filename Collisions in `destDir`):**
-     - When none of the files in the day-batch collide with existing files in `destDir` (and no per-file `beforeVerify` test hook is active), execute:
-       1. **One multi-source `rsync` copy call** for the entire day-batch:
-          `rsync -aXN -- <src1> <src2> ... <destDir>/`
-       2. **One multi-file `xattr` check** across all copied destination files in the batch (`getExtendedAttributesMap(destPaths)`).
-       3. Parallel `stat` + `rsync --dry-run -aN --checksum --itemize-changes` verification (bounded by `concurrency = 4`), then unlink verified source files.
-     - If the batch-level `rsync` copy fails or if any file in the batch has an existing filename in `destDir` (requiring deduplication or ` (1)` collision suffix), seamlessly fall back to the per-file bounded-concurrency (`concurrency = 4`) handler so every file is handled or isolated safely.
+   - **Unified Concurrency-Safe Per-File Pipeline (`archiveSingleFile`):**
+     - Within each day-batch, process up to `concurrency = 4` files in parallel via `mapWithConcurrency`.
+     - Reserve destination paths across the entire run in an APFS-normalized `reservedDestPaths` set (`.normalize("NFD").toLowerCase()`) so concurrent workers can never collide on or overwrite the same `(1)` suffix slot.
+     - Copy via `rsync -aXN`, verify via `rsync --dry-run -aN --checksum --itemize-changes` + `lstat` (size and creation timestamp) + `xattr` (`kMDItemIsScreenCapture` / `kMDItemIsScreenRecording`), and only then unlink the source file.
    - **Per-Batch Audit Flush:**
      - Flush each completed day-batch immediately to `logs/archive.log` and `logs/audit.jsonl` (with `fileDate` / day context).
 
