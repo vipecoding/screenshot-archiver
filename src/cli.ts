@@ -10,6 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
+import { parseArgs } from "node:util";
 import {
   checkModernRsync,
   DEFAULT_BATCH_SIZE,
@@ -22,6 +23,7 @@ import {
   detectMacOSScreenshotSettings,
   expandHomePath,
   inspectAndProcess,
+  isValidDateString,
   type SummaryResource,
 } from "./archiver.ts";
 import {
@@ -88,168 +90,139 @@ Options (history):
   --help, -h                   Show this help message`;
 }
 
+function parsePositiveInt(value: string | undefined, flagName: string): number {
+  const num = Number(value);
+  if (!Number.isInteger(num) || num < 1) {
+    throw new Error(`${flagName} must be a positive integer`);
+  }
+  return num;
+}
+
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
-  const result: ParsedCliArgs = {
-    command: "scan",
-    sourceDir: undefined,
-    destRoot: DEFAULT_DEST_ROOT,
-    dateFormat: DEFAULT_DATE_FORMAT,
-    keepToday: DEFAULT_KEEP_TODAY,
-    screenshotPrefix: undefined,
-    dryRun: false,
-    deleteSource: true,
-    batchSize: DEFAULT_BATCH_SIZE,
-    concurrency: DEFAULT_CONCURRENCY,
-    logDir: resolveDefaultLogDir(),
-    limit: 20,
-    errorsOnly: false,
-    json: false,
-    verbose: false,
-    notifyOnError: true,
-  };
-
-  const args = [...argv];
-  if (args.length === 0) {
-    result.command = "help";
-    return result;
+  if (argv.length === 0) {
+    return {
+      command: "help",
+      destRoot: DEFAULT_DEST_ROOT,
+      dateFormat: DEFAULT_DATE_FORMAT,
+      keepToday: DEFAULT_KEEP_TODAY,
+      dryRun: false,
+      deleteSource: true,
+      batchSize: DEFAULT_BATCH_SIZE,
+      concurrency: DEFAULT_CONCURRENCY,
+      logDir: resolveDefaultLogDir(),
+      limit: 20,
+      errorsOnly: false,
+      json: false,
+      verbose: false,
+      notifyOnError: true,
+    };
   }
 
-  const first = args[0];
-  if (first === "--help" || first === "-h" || first === "help") {
-    result.command = "help";
-    return result;
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    allowNegative: true,
+    strict: true,
+    options: {
+      help: { type: "boolean", short: "h", default: false },
+      "source-dir": { type: "string" },
+      "dest-root": { type: "string" },
+      "date-format": { type: "string" },
+      "screenshot-prefix": { type: "string" },
+      "keep-today": { type: "boolean", default: DEFAULT_KEEP_TODAY },
+      "dry-run": { type: "boolean", default: false },
+      "delete-source": { type: "boolean", default: true },
+      "batch-size": { type: "string" },
+      concurrency: { type: "string" },
+      "log-dir": { type: "string" },
+      today: { type: "string" },
+      limit: { type: "string" },
+      errors: { type: "boolean", default: false },
+      json: { type: "boolean", default: false },
+      verbose: { type: "boolean", short: "v", default: false },
+      notify: { type: "boolean", default: true },
+    },
+  });
+
+  if (values.help || positionals[0] === "help") {
+    return {
+      command: "help",
+      destRoot: DEFAULT_DEST_ROOT,
+      dateFormat: DEFAULT_DATE_FORMAT,
+      keepToday: DEFAULT_KEEP_TODAY,
+      dryRun: false,
+      deleteSource: true,
+      batchSize: DEFAULT_BATCH_SIZE,
+      concurrency: DEFAULT_CONCURRENCY,
+      logDir: resolveDefaultLogDir(),
+      limit: 20,
+      errorsOnly: false,
+      json: false,
+      verbose: false,
+      notifyOnError: true,
+    };
   }
 
+  const subcommand = positionals[0] ?? "scan";
   if (
-    first === "scan" ||
-    first === "archive" ||
-    first === "dry-run" ||
-    first === "history"
+    subcommand !== "scan" &&
+    subcommand !== "archive" &&
+    subcommand !== "dry-run" &&
+    subcommand !== "history"
   ) {
-    result.command = first;
-    if (first === "dry-run") {
-      result.dryRun = true;
-    }
-    args.shift();
-  } else if (!first.startsWith("-")) {
-    throw new Error(`Unknown command: '${first}'. Run with --help for usage.`);
+    throw new Error(
+      `Unknown command: '${subcommand}'. Run with --help for usage.`,
+    );
+  }
+  if (positionals.length > 1) {
+    throw new Error(
+      `Unexpected positional argument: '${positionals[1]}'. Run with --help for usage.`,
+    );
   }
 
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    switch (arg) {
-      case "--help":
-      case "-h":
-        result.command = "help";
-        return result;
-      case "--source-dir": {
-        const val = args[++i];
-        if (!val) throw new Error("Missing value for --source-dir");
-        result.sourceDir = val;
-        break;
-      }
-      case "--dest-root": {
-        const val = args[++i];
-        if (!val) throw new Error("Missing value for --dest-root");
-        result.destRoot = val;
-        break;
-      }
-      case "--date-format": {
-        const val = args[++i];
-        if (!val) throw new Error("Missing value for --date-format");
-        result.dateFormat = val;
-        break;
-      }
-      case "--screenshot-prefix": {
-        const val = args[++i];
-        if (!val) throw new Error("Missing value for --screenshot-prefix");
-        result.screenshotPrefix = val;
-        break;
-      }
-      case "--keep-today":
-        result.keepToday = true;
-        break;
-      case "--no-keep-today":
-        result.keepToday = false;
-        break;
-      case "--dry-run":
-        result.dryRun = true;
-        break;
-      case "--run":
-        result.command = "archive";
-        result.dryRun = false;
-        break;
-      case "--delete-source":
-        result.deleteSource = true;
-        break;
-      case "--no-delete-source":
-        result.deleteSource = false;
-        break;
-      case "--batch-size": {
-        const val = Number(args[++i]);
-        if (!Number.isInteger(val) || val < 1) {
-          throw new Error("--batch-size must be a positive integer");
-        }
-        result.batchSize = val;
-        break;
-      }
-      case "--concurrency": {
-        const val = Number(args[++i]);
-        if (!Number.isInteger(val) || val < 1) {
-          throw new Error("--concurrency must be a positive integer");
-        }
-        result.concurrency = val;
-        break;
-      }
-      case "--log-dir": {
-        const val = args[++i];
-        if (!val) throw new Error("Missing value for --log-dir");
-        result.logDir = val;
-        break;
-      }
-      case "--today": {
-        const val = args[++i];
-        if (!val) throw new Error("Missing value for --today");
-        result.todayOverride = val;
-        break;
-      }
-      case "--limit": {
-        const val = Number(args[++i]);
-        if (!Number.isInteger(val) || val < 1) {
-          throw new Error("--limit must be a positive integer");
-        }
-        result.limit = val;
-        break;
-      }
-      case "--errors":
-        result.errorsOnly = true;
-        break;
-      case "--json":
-        result.json = true;
-        break;
-      case "--verbose":
-      case "-v":
-        result.verbose = true;
-        break;
-      case "--no-notify":
-        result.notifyOnError = false;
-        break;
-      default:
-        throw new Error(`Unknown option: '${arg}'. Run with --help for usage.`);
-    }
+  if (values.today !== undefined && !isValidDateString(values.today)) {
+    throw new Error(
+      `Invalid --today value '${values.today}': expected YYYY-MM-DD calendar date`,
+    );
   }
 
-  return result;
+  return {
+    command: subcommand,
+    sourceDir: values["source-dir"],
+    destRoot: values["dest-root"] ?? DEFAULT_DEST_ROOT,
+    dateFormat: values["date-format"] ?? DEFAULT_DATE_FORMAT,
+    keepToday: values["keep-today"] ?? DEFAULT_KEEP_TODAY,
+    screenshotPrefix: values["screenshot-prefix"],
+    dryRun: subcommand === "dry-run" || Boolean(values["dry-run"]),
+    deleteSource: values["delete-source"] ?? true,
+    batchSize:
+      values["batch-size"] !== undefined
+        ? parsePositiveInt(values["batch-size"], "--batch-size")
+        : DEFAULT_BATCH_SIZE,
+    concurrency:
+      values.concurrency !== undefined
+        ? parsePositiveInt(values.concurrency, "--concurrency")
+        : DEFAULT_CONCURRENCY,
+    logDir: values["log-dir"] ?? resolveDefaultLogDir(),
+    todayOverride: values.today,
+    limit:
+      values.limit !== undefined
+        ? parsePositiveInt(values.limit, "--limit")
+        : 20,
+    errorsOnly: Boolean(values.errors),
+    json: Boolean(values.json),
+    verbose: Boolean(values.verbose),
+    notifyOnError: values.notify ?? true,
+  };
 }
 
 function formatSummaryOutput(
   summary: SummaryResource,
   verbose: boolean,
 ): string {
-  const lines: string[] = [];
-  lines.push(
+  const lines: string[] = [
     `Summary: mode=${summary.mode} scanned=${summary.scannedCount} matched=${summary.matchedCount} eligible=${summary.eligibleCount} days=${summary.dayCount} batches=${summary.batchCount} archived=${summary.archivedCount} copied=${summary.copiedVerifiedCount} deduplicated=${summary.deduplicatedCount} skipped_today=${summary.skippedTodayCount} errors=${summary.errorCount}`,
-  );
+  ];
   if (verbose || summary.errorCount > 0) {
     for (const file of summary.files) {
       if (!verbose && file.status !== "error") continue;
@@ -295,8 +268,6 @@ export async function runCli(argv: string[]): Promise<number> {
     return 0;
   }
 
-  // Auto-detect sourceDir and screenshotPrefix from com.apple.screencapture
-  // when not explicitly provided via CLI flags.
   let effectiveSourceDir = parsed.sourceDir ?? DEFAULT_SOURCE_DIR;
   let effectiveScreenshotPrefix =
     parsed.screenshotPrefix ?? DEFAULT_SCREENSHOT_PREFIX;
@@ -329,18 +300,22 @@ export async function runCli(argv: string[]): Promise<number> {
     if (!rsyncCheck.pass) {
       const errorMessage =
         rsyncCheck.errors?.join("; ") ?? "Modern rsync check failed";
-      await appendFatalAuditError(
-        {
-          runId,
-          mode,
-          sourceDir: expandHomePath(effectiveSourceDir),
-          destRoot: expandHomePath(parsed.destRoot),
-          dateFormat: parsed.dateFormat,
-          screenshotPrefix: effectiveScreenshotPrefix,
-          errorMessage,
-        },
-        auditOptions,
-      );
+      try {
+        await appendFatalAuditError(
+          {
+            runId,
+            mode,
+            sourceDir: expandHomePath(effectiveSourceDir),
+            destRoot: expandHomePath(parsed.destRoot),
+            dateFormat: parsed.dateFormat,
+            screenshotPrefix: effectiveScreenshotPrefix,
+            errorMessage,
+          },
+          auditOptions,
+        );
+      } catch {
+        // Ignore audit write failure when reporting fatal error
+      }
       console.error(errorMessage);
       return 1;
     }
@@ -366,7 +341,11 @@ export async function runCli(argv: string[]): Promise<number> {
         onBatchComplete:
           mode === "archive"
             ? async (batchEvent) => {
-                await appendBatchAudit(batchEvent, auditOptions);
+                try {
+                  await appendBatchAudit(batchEvent, auditOptions);
+                } catch {
+                  // Do not abort active file archiving if log write fails mid-run
+                }
               }
             : undefined,
       },
@@ -374,25 +353,33 @@ export async function runCli(argv: string[]): Promise<number> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     if (mode === "archive") {
-      await appendFatalAuditError(
-        {
-          runId,
-          mode: parsed.deleteSource ? "archive" : "copy-verify",
-          sourceDir: expandHomePath(effectiveSourceDir),
-          destRoot: expandHomePath(parsed.destRoot),
-          dateFormat: parsed.dateFormat,
-          screenshotPrefix: effectiveScreenshotPrefix,
-          errorMessage,
-        },
-        auditOptions,
-      );
+      try {
+        await appendFatalAuditError(
+          {
+            runId,
+            mode: parsed.deleteSource ? "archive" : "copy-verify",
+            sourceDir: expandHomePath(effectiveSourceDir),
+            destRoot: expandHomePath(parsed.destRoot),
+            dateFormat: parsed.dateFormat,
+            screenshotPrefix: effectiveScreenshotPrefix,
+            errorMessage,
+          },
+          auditOptions,
+        );
+      } catch {
+        // Ignore audit write failure
+      }
     }
     console.error(errorMessage);
     return 1;
   }
 
   if (mode === "archive") {
-    await appendRunAudit(summary, auditOptions);
+    try {
+      await appendRunAudit(summary, auditOptions);
+    } catch {
+      // Do not fail completed archive run if final log write fails
+    }
   }
 
   if (parsed.json) {

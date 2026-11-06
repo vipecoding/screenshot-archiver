@@ -186,6 +186,10 @@ describe("screenshot-archiver", () => {
     expect(badDate.matchedPrefix).toBe(true);
     expect(badDate.fileDate).toBeUndefined();
 
+    const corruptedName = parseScreenshotFilename("Screenshot corrupted.png");
+    expect(corruptedName.matchedPrefix).toBe(true);
+    expect(corruptedName.fileDate).toBeUndefined();
+
     const nonMatch = parseScreenshotFilename("vacation-photo.jpg");
     expect(nonMatch.matchedPrefix).toBe(false);
     expect(isValidDateString("2026-11-04")).toBe(true);
@@ -1007,6 +1011,18 @@ describe("screenshot-archiver", () => {
       expect(await fileExists(`${rotLog}.2`)).toBe(true);
       expect(await fileExists(`${rotLog}.3`)).toBe(true);
       expect(await fileExists(`${rotLog}.4`)).toBe(false);
+
+      // Invalid --today flag is rejected with exit code 2
+      const badTodayCode = await runCli([
+        "scan",
+        "--source-dir",
+        sourceDir,
+        "--dest-root",
+        destRoot,
+        "--today",
+        "2026-11-5",
+      ]);
+      expect(badTodayCode).toBe(2);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }

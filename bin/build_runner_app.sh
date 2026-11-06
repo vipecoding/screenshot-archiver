@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SOURCE_SCRIPT="$REPO_ROOT/runner/ScreenshotArchiverRunner.applescript"
+BINARY_PATH="$REPO_ROOT/bin/screenshot-archiver"
 
 SYSTEM_APP_PATH="/Applications/ScreenshotArchiverRunner.app"
 USER_APP_PATH="$HOME/Applications/ScreenshotArchiverRunner.app"
@@ -55,11 +55,6 @@ if [[ "$APP_PATH" != *.app ]]; then
   exit 2
 fi
 
-if [[ ! -f "$SOURCE_SCRIPT" ]]; then
-  printf "Runner source not found: %s\n" "$SOURCE_SCRIPT" >&2
-  exit 1
-fi
-
 APP_PARENT="$(dirname "$APP_PATH")"
 if ! mkdir -p "$APP_PARENT"; then
   printf "Cannot create app parent directory: %s\n" "$APP_PARENT" >&2
@@ -73,7 +68,21 @@ if [[ -e "$APP_PATH" ]] && ! rm -rf "$APP_PATH"; then
   printf "Cannot remove existing app: %s\n" "$APP_PATH" >&2
   exit 1
 fi
-osacompile -o "$APP_PATH" "$SOURCE_SCRIPT"
+
+TMP_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/ScreenshotArchiverRunner.XXXXXX.applescript")"
+trap 'rm -f "$TMP_SCRIPT"' EXIT
+
+cat > "$TMP_SCRIPT" <<EOF
+on run
+  try
+    do shell script "$BINARY_PATH archive"
+  on error errMsg number errNum
+    -- Errors are logged to logs/archive.log + logs/audit.jsonl and notified via Notification Center.
+  end try
+end run
+EOF
+
+osacompile -o "$APP_PATH" "$TMP_SCRIPT"
 
 EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/applet"
 printf "Built runner app: %s\n" "$APP_PATH"

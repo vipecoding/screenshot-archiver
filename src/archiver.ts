@@ -148,24 +148,27 @@ function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function buildScreenshotFullRegex(screenshotPrefix: string): RegExp {
+function buildScreenshotRegexes(screenshotPrefix: string): {
+  full: RegExp;
+  candidate: RegExp;
+} {
   const escaped = escapeRegExp(
     screenshotPrefix.trim() || DEFAULT_SCREENSHOT_PREFIX,
   );
-  return new RegExp(
-    `^${escaped}\\s+(\\d{4}-\\d{2}-\\d{2})\\s+at\\s+.+\\.(png|jpe?g|pdf|tiff?|gif|heic)$`,
-    "i",
-  );
+  return {
+    full: new RegExp(
+      `^${escaped}\\s+(\\d{4}-\\d{2}-\\d{2})\\s+at\\s+.+\\.(png|jpe?g|pdf|tiff?|gif|heic)$`,
+      "i",
+    ),
+    candidate: new RegExp(
+      `^${escaped}\\s+.+\\.(png|jpe?g|pdf|tiff?|gif|heic)$`,
+      "i",
+    ),
+  };
 }
 
-function buildScreenshotCandidateRegex(screenshotPrefix: string): RegExp {
-  const escaped = escapeRegExp(
-    screenshotPrefix.trim() || DEFAULT_SCREENSHOT_PREFIX,
-  );
-  return new RegExp(
-    `^${escaped}\\s+.+\\.(png|jpe?g|pdf|tiff?|gif|heic)$`,
-    "i",
-  );
+function normalizeApfsPathKey(p: string): string {
+  return p.normalize("NFD").toLowerCase();
 }
 
 function buildSubprocessPath(): string {
@@ -176,11 +179,6 @@ function buildSubprocessPath(): string {
   return `${homebrewPrefix}:${suffix}`;
 }
 
-/**
- * Subprocess environment prepending Homebrew `rsync` locations ahead of the
- * active `PATH` so macOS's built-in `openrsync` (2.6.9) is not selected when
- * Homebrew `rsync` (3.x+) is installed.
- */
 export const SUBPROCESS_ENV: Record<string, string> = {
   ...Object.fromEntries(
     Object.entries(process.env).filter(
@@ -196,9 +194,6 @@ export interface SubprocessResult {
   stderr: string;
 }
 
-/**
- * Execute an external binary without a shell and return `{ code, stdout, stderr }`.
- */
 export function execSubprocess(
   command: string,
   args: string[],
@@ -208,10 +203,7 @@ export function execSubprocess(
     execFile(
       command,
       args,
-      {
-        env,
-        maxBuffer: 16 * 1024 * 1024,
-      },
+      { env, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
           const errWithCode = error as NodeJS.ErrnoException & {
@@ -238,9 +230,6 @@ export function execSubprocess(
   });
 }
 
-/**
- * Expand a leading `~` or `~/` in a filesystem path using `HOME`.
- */
 export function expandHomePath(
   inputPath: string,
   homeOverride?: string,
@@ -294,21 +283,17 @@ export async function detectMacOSScreenshotSettings(
     // Ignore if /usr/bin/defaults is unavailable
   }
 
-  const sourceDir = expandHomePath(
-    customLocation || DEFAULT_SOURCE_DIR,
-    homeOverride,
-  );
-  const screenshotPrefix = customPrefix || DEFAULT_SCREENSHOT_PREFIX;
-
   return {
-    sourceDir,
-    screenshotPrefix,
+    sourceDir: expandHomePath(
+      customLocation || DEFAULT_SOURCE_DIR,
+      homeOverride,
+    ),
+    screenshotPrefix: customPrefix || DEFAULT_SCREENSHOT_PREFIX,
     customLocation,
     customPrefix,
   };
 }
 
-/** Return today's local date formatted as YYYY-MM-DD. */
 export function getLocalToday(now: Date = new Date()): string {
   const yyyy = String(now.getFullYear());
   const mm = String(now.getMonth() + 1).padStart(2, "0");
@@ -316,7 +301,6 @@ export function getLocalToday(now: Date = new Date()): string {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-/** Validate that a YYYY-MM-DD string represents a real calendar date. */
 export function isValidDateString(dateStr: string): boolean {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
   if (!match) return false;
@@ -331,10 +315,6 @@ export function isValidDateString(dateStr: string): boolean {
   );
 }
 
-/**
- * Format a YYYY-MM-DD date string using an Obsidian-style date folder pattern
- * supporting YYYY, YY, MM, and DD tokens.
- */
 export function formatDateSubpath(
   fileDate: string,
   dateFormat: string,
@@ -376,14 +356,6 @@ export function formatDateSubpath(
   });
 }
 
-/**
- * Normalize a YYYY-MM-DD string from a screenshot filename.
- * When macOS Region is set to Thailand (or Buddhist calendar), `screencapture`
- * formats the year as Buddhist Era (Gregorian + 543, e.g. 2569 for 2026).
- * If the year falls within the realistic Buddhist Era window relative to
- * `referenceYear` (`[referenceYear + 500, referenceYear + 545]`), subtract 543
- * to convert it to the Gregorian year.
- */
 export function normalizeScreenshotDate(
   rawDate: string,
   referenceYear: number = new Date().getFullYear(),
@@ -397,10 +369,6 @@ export function normalizeScreenshotDate(
   return `${String(year).padStart(4, "0")}-${match[2]}`;
 }
 
-/**
- * Parse a macOS screenshot or screen recording filename using explicit
- * per-kind regexes that validate both prefix and file extension together.
- */
 export function parseScreenshotFilename(
   filename: string,
   referenceYear: number = new Date().getFullYear(),
@@ -423,7 +391,8 @@ export function parseScreenshotFilename(
     };
   }
 
-  const shotFullRegex = buildScreenshotFullRegex(screenshotPrefix);
+  const { full: shotFullRegex, candidate: shotCandidateRegex } =
+    buildScreenshotRegexes(screenshotPrefix);
   const shotMatch = shotFullRegex.exec(filename);
   if (shotMatch) {
     const normalizedDate = normalizeScreenshotDate(shotMatch[1], referenceYear);
@@ -437,30 +406,16 @@ export function parseScreenshotFilename(
     };
   }
 
-  // Check if the filename has a valid capture prefix + extension but an unparseable date
-  // (e.g. "Screenshot bad-date.png"), while excluding unrelated files like "Screenshot notes.txt"
-  // or mismatched extensions like "Screen Recording 2026-11-03 at 10.00.00.jpg".
-  const shotCandidateRegex = buildScreenshotCandidateRegex(screenshotPrefix);
   if (
     SCREEN_RECORDING_CANDIDATE_REGEX.test(filename) ||
     shotCandidateRegex.test(filename)
   ) {
-    const prefixUsed = screenshotPrefix.trim() || DEFAULT_SCREENSHOT_PREFIX;
-    const remainder = filename.startsWith("Screen Recording ")
-      ? filename.slice("Screen Recording ".length)
-      : filename.slice(prefixUsed.length + 1);
-    if (/\d|bad-date/i.test(remainder)) {
-      return { matchedPrefix: true };
-    }
+    return { matchedPrefix: true };
   }
 
   return { matchedPrefix: false };
 }
 
-/**
- * Inspect extended attributes for a list of file paths in chunked `xattr`
- * calls. Reading xattrs on APFS does not trigger iCloud downloads on dataless files.
- */
 export async function getExtendedAttributesMap(
   filePaths: string[],
   batchSize: number = XATTR_BATCH_SIZE,
@@ -483,67 +438,49 @@ export async function getExtendedAttributesMap(
       SUBPROCESS_ENV,
     );
     if (output.code !== 0) {
+      if (batch.length > 1) {
+        for (const singlePath of batch) {
+          try {
+            const singleMap = await getExtendedAttributesMap([singlePath], 1);
+            const attrs = singleMap.get(singlePath);
+            if (attrs) result.set(singlePath, attrs);
+          } catch {
+            // Ignore vanished file in multi-file batch
+          }
+        }
+        continue;
+      }
       const stderr = output.stderr.trim();
       throw new Error(
         `xattr exited with code ${output.code}: ${stderr || "unknown error"}`,
       );
     }
 
-    const stdout = output.stdout;
     if (batch.length === 1) {
       const singleSet = result.get(batch[0])!;
-      for (const rawLine of stdout.split("\n")) {
+      for (const rawLine of output.stdout.split("\n")) {
         const attrName = rawLine.trim();
-        if (attrName) {
-          singleSet.add(attrName);
-        }
+        if (attrName) singleSet.add(attrName);
       }
       continue;
     }
 
-    for (const rawLine of stdout.split("\n")) {
+    // Sort candidate paths longest-first so a path prefix never shadows a longer path
+    const sortedBatch = [...batch].sort((a, b) => b.length - a.length);
+    for (const rawLine of output.stdout.split("\n")) {
       if (!rawLine.trim()) continue;
-      let matchedPath: string | null = null;
-      let attrName = "";
-
-      for (const candidatePath of batch) {
+      for (const candidatePath of sortedBatch) {
         const prefix = `${candidatePath}: `;
         if (rawLine.startsWith(prefix)) {
-          matchedPath = candidatePath;
-          attrName = rawLine.slice(prefix.length).trim();
+          const attrName = rawLine.slice(prefix.length).trim();
+          if (attrName) result.get(candidatePath)?.add(attrName);
           break;
         }
-      }
-
-      if (!matchedPath) {
-        const sepIndex = rawLine.lastIndexOf(": ");
-        if (sepIndex !== -1) {
-          matchedPath = rawLine.slice(0, sepIndex);
-          attrName = rawLine.slice(sepIndex + 2).trim();
-        }
-      }
-
-      if (matchedPath && attrName) {
-        let set = result.get(matchedPath);
-        if (!set) {
-          set = new Set<string>();
-          result.set(matchedPath, set);
-        }
-        set.add(attrName);
       }
     }
   }
 
   return result;
-}
-
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await stat(p);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 export async function isDirectory(p: string): Promise<boolean> {
@@ -572,71 +509,11 @@ async function runRsyncCopy(
   return { ok: output.code === 0, stderr: output.stderr.trim() };
 }
 
-/**
- * Copy multiple source files into a single destination directory (`destDir/`)
- * in a single `rsync -aXN` invocation.
- */
-async function runRsyncBatchCopy(
-  sourcePaths: string[],
-  destDir: string,
-): Promise<{ ok: boolean; stderr: string }> {
-  if (sourcePaths.length === 0) return { ok: true, stderr: "" };
-  const destDirWithSlash = destDir.endsWith("/") ? destDir : `${destDir}/`;
-  const args = ["-aXN", "--", ...sourcePaths, destDirWithSlash];
-  const output = await execSubprocess("rsync", args, SUBPROCESS_ENV);
-  return { ok: output.code === 0, stderr: output.stderr.trim() };
-}
-
-/**
- * Verify multiple source files against their copies in `destDir/` in a single
- * `rsync --dry-run -aN --checksum --itemize-changes` invocation.
- */
-async function runRsyncBatchChecksumVerify(
-  sourcePaths: string[],
-  destDir: string,
-): Promise<{ ok: boolean; details: string }> {
-  if (sourcePaths.length === 0) {
-    return { ok: true, details: "rsync batch checksum verified" };
-  }
-  const destDirWithSlash = destDir.endsWith("/") ? destDir : `${destDir}/`;
-  const args = [
-    "--dry-run",
-    "-aN",
-    "--checksum",
-    "--itemize-changes",
-    "--",
-    ...sourcePaths,
-    destDirWithSlash,
-  ];
-  const output = await execSubprocess("rsync", args, SUBPROCESS_ENV);
-  const stdout = output.stdout.trim();
-  const stderr = output.stderr.trim();
-  if (output.code !== 0) {
-    return {
-      ok: false,
-      details: stderr || `rsync exited with code ${output.code}`,
-    };
-  }
-  if (stdout.length > 0) {
-    return {
-      ok: false,
-      details: `rsync checksum check reported differences: ${stdout}`,
-    };
-  }
-  return { ok: true, details: "rsync batch checksum verified" };
-}
-
 async function runRsyncChecksumVerify(
   sourcePath: string,
   destPath: string,
   includeMetadata = false,
 ): Promise<{ ok: boolean; details: string }> {
-  // Note: copy uses `rsync -aXN` to copy all extended attributes and creation
-  // timestamps, and destination screen-capture xattrs are explicitly verified via
-  // `getExtendedAttributesMap`. We omit `-X` during `--itemize-changes` dry-run
-  // because macOS kernel-managed `com.apple.macl` / `com.apple.provenance` xattrs
-  // can differ between ~/Desktop and iCloud Drive even when all user/Spotlight
-  // xattrs and file contents are identical (`.f........x`).
   const args = includeMetadata
     ? [
         "--dry-run",
@@ -674,9 +551,40 @@ async function runRsyncChecksumVerify(
 }
 
 /**
- * Verify that `rsync` on the given `env` is a modern 3.x+ build supporting
- * `-X` (`xattrs`) and `-N` (`crtimes`), rather than macOS `openrsync`.
+ * Shared verification helper checking `rsync --dry-run -aN --checksum`, byte
+ * size, expected screen-capture `xattr`, and APFS creation timestamp (`birthtime`).
  */
+async function verifyCopiedFile(
+  sourcePath: string,
+  sourceStat: Stats,
+  destPath: string,
+  expectedXattr: string,
+): Promise<void> {
+  const verifyResult = await runRsyncChecksumVerify(sourcePath, destPath, true);
+  if (!verifyResult.ok) {
+    throw new Error(verifyResult.details);
+  }
+  const [destStat, destXattrs] = await Promise.all([
+    stat(destPath),
+    getExtendedAttributesMap([destPath]),
+  ]);
+  if (destStat.size !== sourceStat.size) {
+    throw new Error(
+      `Size mismatch (src=${sourceStat.size}, dst=${destStat.size})`,
+    );
+  }
+  if (!destXattrs.get(destPath)?.has(expectedXattr)) {
+    throw new Error(
+      `Destination file is missing expected extended attribute ${expectedXattr}: ${destPath}`,
+    );
+  }
+  if (!birthtimesMatch(sourceStat.birthtime, destStat.birthtime)) {
+    throw new Error(
+      `Destination file creation timestamp mismatch: ${destPath}`,
+    );
+  }
+}
+
 export async function checkModernRsync(
   env: Record<string, string> = SUBPROCESS_ENV,
 ): Promise<{ pass: boolean; errors?: string[] }> {
@@ -717,9 +625,6 @@ export async function checkModernRsync(
   return { pass: true };
 }
 
-/**
- * Validate `dateFormat` pattern.
- */
 export function validateDateFormat(dateFormat: string): {
   pass: boolean;
   errors?: string[];
@@ -735,9 +640,6 @@ export function validateDateFormat(dateFormat: string): {
   }
 }
 
-/**
- * Validate that `sourceDir` and `destRoot` exist on disk.
- */
 export async function validateDirectories(
   sourceDirInput: string,
   destRootInput: string,
@@ -755,13 +657,8 @@ export async function validateDirectories(
 }
 
 /**
- * Check if an existing file in `destDir` (`filename`, `filename (1)`, ...) already
- * matches `sourcePath` by byte size and `rsync --checksum`.
- * If a byte-for-byte match is found and the destination file is missing the
- * expected extended attribute or creation timestamp, syncs metadata in place via
- * `rsync -aXN --checksum` and re-verifies before returning.
- * Otherwise returns `{ alreadyPresent: false, destPath }` pointing to the first
- * unoccupied filename slot.
+ * Resolve destination path with content-checksum deduplication and concurrency-safe
+ * `(1)` slot reservation.
  */
 async function resolveDestinationWithDeduplication(
   sourcePath: string,
@@ -769,16 +666,43 @@ async function resolveDestinationWithDeduplication(
   destDir: string,
   filename: string,
   expectedXattr: string,
+  reservedDestPaths: Set<string>,
   syncMetadata = true,
 ): Promise<{ alreadyPresent: boolean; destPath: string }> {
   const { name: base, ext } = parse(filename);
   const sourceSizeBytes = sourceStat.size;
+  const sourceDataless = sourceSizeBytes > 0 && sourceStat.blocks === 0;
   let candidate = join(destDir, filename);
   let n = 1;
 
-  while (await pathExists(candidate)) {
-    const destStat = await stat(candidate);
+  while (true) {
+    const candidateKey = normalizeApfsPathKey(candidate);
+    let destStat: Stats | null = null;
+    try {
+      destStat = await stat(candidate);
+    } catch {
+      destStat = null;
+    }
+
+    if (!destStat) {
+      if (!reservedDestPaths.has(candidateKey)) {
+        reservedDestPaths.add(candidateKey);
+        return { alreadyPresent: false, destPath: candidate };
+      }
+      candidate = join(destDir, `${base} (${n})${ext}`);
+      n += 1;
+      continue;
+    }
+
     if (destStat.isFile() && destStat.size === sourceSizeBytes) {
+      const destDataless = destStat.size > 0 && destStat.blocks === 0;
+      // Avoid materializing evicted iCloud files during read-only scan/dry-run
+      if (!syncMetadata && (sourceDataless || destDataless)) {
+        candidate = join(destDir, `${base} (${n})${ext}`);
+        n += 1;
+        continue;
+      }
+
       const rsyncCheck = await runRsyncChecksumVerify(
         sourcePath,
         candidate,
@@ -796,62 +720,31 @@ async function resolveDestinationWithDeduplication(
           );
 
           if (!hasXattr || !hasMatchingBirthtime) {
-            // Use --checksum so rsync sees the file contents already match and updates
-            // xattrs (-X) and creation time (-N) in place on the existing inode.
             const syncResult = await runRsyncCopy(sourcePath, candidate, true);
             if (!syncResult.ok) {
               throw new Error(
                 `rsync metadata sync failed on existing file: ${syncResult.stderr}`,
               );
             }
-            const recheck = await runRsyncChecksumVerify(
+            await verifyCopiedFile(
               sourcePath,
+              sourceStat,
               candidate,
-              true,
+              expectedXattr,
             );
-            if (!recheck.ok) {
-              throw new Error(recheck.details);
-            }
-            const [reverifiedStat, reverifiedXattrs] = await Promise.all([
-              stat(candidate),
-              getExtendedAttributesMap([candidate]),
-            ]);
-            if (reverifiedStat.size !== sourceSizeBytes) {
-              throw new Error(
-                `Size mismatch after metadata sync on existing file: ${candidate}`,
-              );
-            }
-            if (!reverifiedXattrs.get(candidate)?.has(expectedXattr)) {
-              throw new Error(
-                `Destination file is missing expected extended attribute ${expectedXattr} after rsync -aXN: ${candidate}`,
-              );
-            }
-            if (
-              !birthtimesMatch(sourceStat.birthtime, reverifiedStat.birthtime)
-            ) {
-              throw new Error(
-                `Destination file creation timestamp mismatch after rsync -aXN: ${candidate}`,
-              );
-            }
           }
         }
 
-        return {
-          alreadyPresent: true,
-          destPath: candidate,
-        };
+        reservedDestPaths.add(candidateKey);
+        return { alreadyPresent: true, destPath: candidate };
       }
     }
+
     candidate = join(destDir, `${base} (${n})${ext}`);
     n += 1;
   }
-
-  return { alreadyPresent: false, destPath: candidate };
 }
 
-/**
- * Run an async mapper over `items` with bounded concurrency, preserving input order.
- */
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
   concurrency: number,
@@ -869,17 +762,14 @@ export async function mapWithConcurrency<T, R>(
     while (true) {
       const currentIndex = nextIndex;
       nextIndex += 1;
-      if (currentIndex >= items.length) {
-        return;
-      }
+      if (currentIndex >= items.length) return;
       results[currentIndex] = await worker(items[currentIndex], currentIndex);
     }
   }
 
-  const workers = Array.from({ length: effectiveConcurrency }, () =>
-    runWorker(),
+  await Promise.all(
+    Array.from({ length: effectiveConcurrency }, () => runWorker()),
   );
-  await Promise.all(workers);
   return results;
 }
 
@@ -1011,6 +901,7 @@ export function createArchivePlan<
  */
 async function archiveSingleFile(
   item: EligibleCandidate,
+  reservedDestPaths: Set<string>,
   deleteSource: boolean,
   beforeVerify?: (destPath: string) => Promise<void> | void,
 ): Promise<CandidateFile> {
@@ -1023,6 +914,8 @@ async function archiveSingleFile(
       item.destDir,
       item.filename,
       item.expectedXattr,
+      reservedDestPaths,
+      true,
     );
     attemptedDestPath = resolved.destPath;
 
@@ -1053,35 +946,12 @@ async function archiveSingleFile(
       await beforeVerify(finalDestPath);
     }
 
-    const verifyResult = await runRsyncChecksumVerify(
+    await verifyCopiedFile(
       item.sourcePath,
+      item.statInfo,
       finalDestPath,
-      true,
+      item.expectedXattr,
     );
-    if (!verifyResult.ok) {
-      throw new Error(verifyResult.details);
-    }
-
-    const [destStat, destXattrs] = await Promise.all([
-      stat(finalDestPath),
-      getExtendedAttributesMap([finalDestPath]),
-    ]);
-
-    if (destStat.size !== item.sizeBytes) {
-      throw new Error(
-        `Size mismatch (src=${item.sizeBytes}, dst=${destStat.size})`,
-      );
-    }
-    if (!destXattrs.get(finalDestPath)?.has(item.expectedXattr)) {
-      throw new Error(
-        `Destination file is missing expected extended attribute ${item.expectedXattr}: ${finalDestPath}`,
-      );
-    }
-    if (!birthtimesMatch(item.statInfo.birthtime, destStat.birthtime)) {
-      throw new Error(
-        `Destination file creation timestamp mismatch: ${finalDestPath}`,
-      );
-    }
 
     createdNewDestFile = false;
     if (deleteSource) {
@@ -1097,6 +967,7 @@ async function archiveSingleFile(
     });
   } catch (err) {
     if (createdNewDestFile && attemptedDestPath) {
+      reservedDestPaths.delete(normalizeApfsPathKey(attemptedDestPath));
       try {
         await rm(attemptedDestPath, { force: true });
       } catch {
@@ -1112,155 +983,6 @@ async function archiveSingleFile(
       error: err instanceof Error ? err.message : String(err),
     });
   }
-}
-
-/**
- * Fast 3-call batch pipeline for collision-free files in a single day's folder:
- *   1. `rsync -aXN -- <sources...> <destDir>/`
- *   2. `rsync --dry-run -aN --checksum --itemize-changes -- <sources...> <destDir>/`
- *   3. `xattr -- <destPaths...>`
- * Returns `null` if any step fails so the caller can fall back to `archiveSingleFile`.
- */
-async function tryArchiveFreshBatch(
-  freshItems: readonly EligibleCandidate[],
-  destDir: string,
-  deleteSource: boolean,
-): Promise<CandidateFile[] | null> {
-  if (freshItems.length === 0) return [];
-  const sourcePaths = freshItems.map((item) => item.sourcePath);
-  const destPaths = freshItems.map((item) => join(destDir, item.filename));
-
-  const cleanupDestPaths = async (): Promise<void> => {
-    for (const p of destPaths) {
-      try {
-        await rm(p, { force: true });
-      } catch {
-        // Ignore cleanup failure
-      }
-    }
-  };
-
-  try {
-    const copyRes = await runRsyncBatchCopy(sourcePaths, destDir);
-    if (!copyRes.ok) {
-      await cleanupDestPaths();
-      return null;
-    }
-
-    const verifyRes = await runRsyncBatchChecksumVerify(sourcePaths, destDir);
-    if (!verifyRes.ok) {
-      await cleanupDestPaths();
-      return null;
-    }
-
-    const xattrMap = await getExtendedAttributesMap(destPaths);
-    for (let i = 0; i < freshItems.length; i += 1) {
-      const item = freshItems[i];
-      const destPath = destPaths[i];
-      if (!xattrMap.get(destPath)?.has(item.expectedXattr)) {
-        await cleanupDestPaths();
-        return null;
-      }
-    }
-  } catch {
-    await cleanupDestPaths();
-    return null;
-  }
-
-  // All files in `freshItems` are copied and verified; now remove sources if requested
-  const results: CandidateFile[] = [];
-  for (let i = 0; i < freshItems.length; i += 1) {
-    const item = freshItems[i];
-    const destPath = destPaths[i];
-    try {
-      if (deleteSource) {
-        await unlink(item.sourcePath);
-      }
-      results.push(
-        buildCandidateRecord(item, {
-          status: deleteSource ? "archived" : "copied-verified",
-          destDir,
-          destDirExists: true,
-          destPath,
-          sourceDeleted: deleteSource,
-        }),
-      );
-    } catch (err) {
-      results.push(
-        buildCandidateRecord(item, {
-          status: "error",
-          destDir,
-          destDirExists: true,
-          destPath,
-          sourceDeleted: false,
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      );
-    }
-  }
-
-  return results;
-}
-
-/**
- * Execute a single day-batch by partitioning into collision-free `fresh` files
- * (eligible for the 3-subprocess batch fast path) and `colliding` files
- * (handled individually for deduplication or `(1)` suffixing).
- */
-async function executeDayArchiveBatch(
-  batch: readonly EligibleCandidate[],
-  destDir: string,
-  existingNamesInDayDir: Set<string>,
-  deleteSource: boolean,
-  concurrency: number,
-  beforeVerify?: (destPath: string) => Promise<void> | void,
-): Promise<CandidateFile[]> {
-  const results = new Array<CandidateFile>(batch.length);
-  const freshIndices: number[] = [];
-  const collidingIndices: number[] = [];
-
-  for (let i = 0; i < batch.length; i += 1) {
-    if (existingNamesInDayDir.has(batch[i].filename)) {
-      collidingIndices.push(i);
-    } else {
-      freshIndices.push(i);
-    }
-  }
-
-  if (freshIndices.length > 0) {
-    const freshItems = freshIndices.map((idx) => batch[idx]);
-    const fastResults = !beforeVerify
-      ? await tryArchiveFreshBatch(freshItems, destDir, deleteSource)
-      : null;
-
-    const resolvedFreshResults =
-      fastResults ??
-      (await mapWithConcurrency(freshItems, concurrency, (item) =>
-        archiveSingleFile(item, deleteSource, beforeVerify),
-      ));
-
-    for (let j = 0; j < freshIndices.length; j += 1) {
-      const result = resolvedFreshResults[j];
-      results[freshIndices[j]] = result;
-      if (result.status !== "error") {
-        existingNamesInDayDir.add(result.filename);
-      }
-    }
-  }
-
-  if (collidingIndices.length > 0) {
-    const collidingItems = collidingIndices.map((idx) => batch[idx]);
-    const collidingResults = await mapWithConcurrency(
-      collidingItems,
-      concurrency,
-      (item) => archiveSingleFile(item, deleteSource, beforeVerify),
-    );
-    for (let j = 0; j < collidingIndices.length; j += 1) {
-      results[collidingIndices[j]] = collidingResults[j];
-    }
-  }
-
-  return results;
 }
 
 /**
@@ -1297,6 +1019,12 @@ export async function inspectAndProcess(
   const runId = options?.runId ?? randomUUID();
 
   formatDateSubpath("2026-11-05", dateFormat);
+
+  if (todayOverride !== undefined && !isValidDateString(todayOverride)) {
+    throw new Error(
+      `Invalid today date '${todayOverride}': expected YYYY-MM-DD`,
+    );
+  }
 
   if (!(await isDirectory(sourceDir))) {
     throw new Error(`Source directory does not exist: ${sourceDir}`);
@@ -1348,9 +1076,7 @@ export async function inspectAndProcess(
       referenceYear,
       screenshotPrefix,
     );
-    if (!parsed.matchedPrefix) {
-      continue;
-    }
+    if (!parsed.matchedPrefix) continue;
     if (!parsed.fileDate || !parsed.kind) {
       skippedUnparseableCount += 1;
       continue;
@@ -1389,12 +1115,16 @@ export async function inspectAndProcess(
       continue;
     }
 
-    matchedCount += 1;
+    let statInfo: Stats;
+    try {
+      statInfo = await stat(sourcePath);
+    } catch {
+      // File vanished between readdir and stat; skip safely
+      continue;
+    }
 
-    const statInfo = await stat(sourcePath);
+    matchedCount += 1;
     const sizeBytes = statInfo.size;
-    // On modern macOS APFS + FileProvider, evicted dataless files report logical size > 0
-    // with 0 allocated blocks on disk.
     const dataless = sizeBytes > 0 && statInfo.blocks === 0;
     if (dataless) {
       datalessCount += 1;
@@ -1455,6 +1185,8 @@ export async function inspectAndProcess(
   let globalBatchIndex = 0;
 
   for (const dayPlan of plan.days) {
+    const reservedDestPaths = new Set<string>();
+
     if (mode === "scan" || mode === "dry-run") {
       for (const batch of dayPlan.batches) {
         globalBatchIndex += 1;
@@ -1462,19 +1194,23 @@ export async function inspectAndProcess(
           batch,
           concurrency,
           async (item) => {
-            const resolved = item.destDirExistsBefore
-              ? await resolveDestinationWithDeduplication(
-                  item.sourcePath,
-                  item.statInfo,
-                  item.destDir,
-                  item.filename,
-                  item.expectedXattr,
-                  false,
-                )
-              : {
-                  alreadyPresent: false,
-                  destPath: join(item.destDir, item.filename),
-                };
+            if (!item.destDirExistsBefore) {
+              const candidate = join(item.destDir, item.filename);
+              reservedDestPaths.add(normalizeApfsPathKey(candidate));
+              return {
+                item,
+                resolved: { alreadyPresent: false, destPath: candidate },
+              };
+            }
+            const resolved = await resolveDestinationWithDeduplication(
+              item.sourcePath,
+              item.statInfo,
+              item.destDir,
+              item.filename,
+              item.expectedXattr,
+              reservedDestPaths,
+              false,
+            );
             return { item, resolved };
           },
         );
@@ -1519,12 +1255,8 @@ export async function inspectAndProcess(
     // Mode === "archive":
     // 1. Ensure this day's destination directory exists once for the entire day
     let dayMkdirError: string | null = null;
-    const existingNamesInDayDir = new Set<string>();
     try {
       await mkdir(dayPlan.destDir, { recursive: true });
-      for (const name of await readdir(dayPlan.destDir)) {
-        existingNamesInDayDir.add(name);
-      }
     } catch (err) {
       dayMkdirError = err instanceof Error ? err.message : String(err);
     }
@@ -1543,13 +1275,13 @@ export async function inspectAndProcess(
               error: `mkdir failed for ${item.destDir}: ${dayMkdirError}`,
             }),
           )
-        : await executeDayArchiveBatch(
-            batch,
-            dayPlan.destDir,
-            existingNamesInDayDir,
-            deleteSource,
-            concurrency,
-            options?.beforeVerify,
+        : await mapWithConcurrency(batch, concurrency, (item) =>
+            archiveSingleFile(
+              item,
+              reservedDestPaths,
+              deleteSource,
+              options?.beforeVerify,
+            ),
           );
 
       let batchCopiedVerified = 0;

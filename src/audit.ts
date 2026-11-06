@@ -89,9 +89,8 @@ export interface AuditOptions {
 }
 
 /**
- * Resolve the default `logs/` directory next to the repository root, working
- * both from source (`src/audit.ts`) and from a `bun build --compile` binary
- * (`bin/screenshot-archiver`) regardless of the process working directory.
+ * Resolve the default `logs/` directory next to the repository root, or
+ * `~/Library/Logs/screenshot-archiver` when installed under a system prefix.
  */
 export function resolveDefaultLogDir(): string {
   const envDir = process.env.SCREENSHOT_ARCHIVER_LOG_DIR;
@@ -110,8 +109,15 @@ export function resolveDefaultLogDir(): string {
     // Fallback to process.execPath below
   }
 
-  const execDir = dirname(process.execPath);
-  const repoRoot = dirname(execDir);
+  const repoRoot = dirname(dirname(process.execPath));
+  if (
+    repoRoot === "/" ||
+    repoRoot.startsWith("/usr") ||
+    repoRoot.startsWith("/opt") ||
+    repoRoot.startsWith("/bin")
+  ) {
+    return expandHomePath("~/Library/Logs/screenshot-archiver");
+  }
   return join(repoRoot, "logs");
 }
 
@@ -180,29 +186,29 @@ export async function rotateLogIfNeeded(
   }
 
   const oldest = `${filePath}.${maxRotatedFiles}`;
-  if (await fileExists(oldest)) {
-    await rm(oldest, { force: true });
-  }
+  await rm(oldest, { force: true });
 
   for (let i = maxRotatedFiles - 1; i >= 1; i -= 1) {
     const src = `${filePath}.${i}`;
     const dst = `${filePath}.${i + 1}`;
-    if (await fileExists(src)) {
+    try {
       await rename(src, dst);
+    } catch {
+      // Ignore if rotated slot does not exist yet
     }
   }
 
-  await rename(filePath, `${filePath}.1`);
-  return true;
+  try {
+    await rename(filePath, `${filePath}.1`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-/**
- * Append a batch progress event immediately to `archive.log` and `audit.jsonl`.
- */
-export async function appendBatchAudit(
-  event: BatchProgressEvent,
+async function prepareLogFiles(
   options?: AuditOptions,
-): Promise<void> {
+): Promise<{ archiveLogPath: string; auditJsonlPath: string }> {
   const logDir = expandHomePath(options?.logDir ?? resolveDefaultLogDir());
   const maxBytes = options?.maxLogBytes ?? MAX_LOG_BYTES;
   const maxFiles = options?.maxRotatedFiles ?? MAX_ROTATED_FILES;
@@ -213,7 +219,17 @@ export async function appendBatchAudit(
 
   await rotateLogIfNeeded(archiveLogPath, maxBytes, maxFiles);
   await rotateLogIfNeeded(auditJsonlPath, maxBytes, maxFiles);
+  return { archiveLogPath, auditJsonlPath };
+}
 
+/**
+ * Append a batch progress event immediately to `archive.log` and `audit.jsonl`.
+ */
+export async function appendBatchAudit(
+  event: BatchProgressEvent,
+  options?: AuditOptions,
+): Promise<void> {
+  const { archiveLogPath, auditJsonlPath } = await prepareLogFiles(options);
   const shortRunId = event.runId.slice(0, 8);
   const humanLines: string[] = [];
 
@@ -265,26 +281,12 @@ export async function appendRunAudit(
   summary: SummaryResource,
   options?: AuditOptions,
 ): Promise<void> {
-  const logDir = expandHomePath(options?.logDir ?? resolveDefaultLogDir());
-  const maxBytes = options?.maxLogBytes ?? MAX_LOG_BYTES;
-  const maxFiles = options?.maxRotatedFiles ?? MAX_ROTATED_FILES;
-  await mkdir(logDir, { recursive: true });
-
-  const archiveLogPath = join(logDir, "archive.log");
-  const auditJsonlPath = join(logDir, "audit.jsonl");
-
-  await rotateLogIfNeeded(archiveLogPath, maxBytes, maxFiles);
-  await rotateLogIfNeeded(auditJsonlPath, maxBytes, maxFiles);
-
+  const { archiveLogPath, auditJsonlPath } = await prepareLogFiles(options);
   const shortRunId = summary.runId.slice(0, 8);
   const summaryLine =
     `[${summary.timestamp}] [run:${shortRunId}] Summary: mode=${summary.mode} scanned=${summary.scannedCount} matched=${summary.matchedCount} eligible=${summary.eligibleCount} days=${summary.dayCount} batches=${summary.batchCount} archived=${summary.archivedCount} copied=${summary.copiedVerifiedCount} deduplicated=${summary.deduplicatedCount} skipped_today=${summary.skippedTodayCount} errors=${summary.errorCount}\n`;
 
   await appendFile(archiveLogPath, summaryLine, "utf8");
-
-  const actionableFiles = summary.files
-    .filter((f) => f.status !== "skipped-today")
-    .map(toAuditFileRecord);
 
   const runRecord: AuditRunRecord = {
     recordType: "run",
@@ -314,7 +316,9 @@ export async function appendRunAudit(
     datalessCount: summary.datalessCount,
     errorCount: summary.errorCount,
     fatalError: null,
-    files: actionableFiles,
+    files: summary.files
+      .filter((f) => f.status !== "skipped-today")
+      .map(toAuditFileRecord),
   };
 
   await appendFile(auditJsonlPath, `${JSON.stringify(runRecord)}\n`, "utf8");
@@ -327,8 +331,7 @@ export async function appendRunAudit(
 }
 
 /**
- * Append a fatal error record (such as missing destination root or rsync check
- * failure) to `archive.log` and `audit.jsonl`.
+ * Append a fatal error record to `archive.log` and `audit.jsonl`.
  */
 export async function appendFatalAuditError(
   params: {
@@ -342,17 +345,7 @@ export async function appendFatalAuditError(
   },
   options?: AuditOptions,
 ): Promise<void> {
-  const logDir = expandHomePath(options?.logDir ?? resolveDefaultLogDir());
-  const maxBytes = options?.maxLogBytes ?? MAX_LOG_BYTES;
-  const maxFiles = options?.maxRotatedFiles ?? MAX_ROTATED_FILES;
-  await mkdir(logDir, { recursive: true });
-
-  const archiveLogPath = join(logDir, "archive.log");
-  const auditJsonlPath = join(logDir, "audit.jsonl");
-
-  await rotateLogIfNeeded(archiveLogPath, maxBytes, maxFiles);
-  await rotateLogIfNeeded(auditJsonlPath, maxBytes, maxFiles);
-
+  const { archiveLogPath, auditJsonlPath } = await prepareLogFiles(options);
   const timestamp = new Date().toISOString();
   const shortRunId = params.runId.slice(0, 8);
   const logLine =
@@ -400,13 +393,25 @@ export async function appendFatalAuditError(
 }
 
 /**
- * Trigger a best-effort macOS Notification Center alert via `osascript`.
+ * Trigger a best-effort macOS Notification Center alert via `osascript` passing
+ * `message` safely as an `argv` parameter.
  */
 export async function sendErrorNotification(message: string): Promise<void> {
-  const sanitized = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const script = `display notification "${sanitized}" with title "Screenshot Archiver Error"`;
   try {
-    await execSubprocess("osascript", ["-e", script], SUBPROCESS_ENV);
+    await execSubprocess(
+      "osascript",
+      [
+        "-e",
+        "on run argv",
+        "-e",
+        'display notification (item 1 of argv) with title "Screenshot Archiver Error"',
+        "-e",
+        "end run",
+        "--",
+        message,
+      ],
+      SUBPROCESS_ENV,
+    );
   } catch {
     // Best-effort only: ignore errors in headless or non-macOS test environments
   }
@@ -536,9 +541,6 @@ export async function readAuditHistory(
   return filtered.reverse().slice(0, limit);
 }
 
-/**
- * Format audit history runs as human-readable text for `screenshot-archiver history`.
- */
 export function formatAuditHistory(
   runs: AuditRunRecord[],
   options?: { errorsOnly?: boolean },
