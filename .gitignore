@@ -1,11 +1,7 @@
-# BEGIN swamp managed section - DO NOT EDIT
-
-# Runtime data (not needed in version control)
-.swamp/
-
-# Local extension sources (developer-specific, not shared)
-.swamp-sources.yaml
-# END swamp managed section
-
 .DS_Store
-
+*.pem
+*.tmp
+.*.bun-build
+node_modules/
+/bin/screenshot-archiver
+/logs/
