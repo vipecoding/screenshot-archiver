@@ -9,7 +9,7 @@ trigger:
     maxDelay: 24h
 jobs:
   - name: archive-desktop-screenshots
-    description: Scan Desktop screenshots and archive eligible files (< today) with rsync checksum + SHA-256 verification
+    description: Scan Desktop screenshots and archive eligible files (< today) with rsync -aXN + checksum verification
     steps:
       - name: scan
         description: Scan Desktop for eligible screenshots and screen recordings
@@ -21,7 +21,10 @@ jobs:
         weight: 0
         allowFailure: false
       - name: archive
-        description: Copy eligible files via rsync, verify checksum + SHA-256, and remove from Desktop
+        description: Copy eligible files via rsync -aXN, verify checksum + xattrs, and remove from Desktop
+        # In Swamp workflows, a truthy guard skips the step ("guarded").
+        # Skip archive when scan found 0 eligible files (run archive only when eligibleCount > 0).
+        guard: ${{ data.latest("screenshot-archiver", "main").attributes.eligibleCount == 0 }}
         task:
           type: behavior
           behavior: screenshot-archiver
