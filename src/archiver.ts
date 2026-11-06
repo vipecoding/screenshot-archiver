@@ -9,7 +9,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import { mkdir, readdir, rm, stat, unlink } from "node:fs/promises";
-import { extname, join, parse } from "node:path";
+import { join, parse } from "node:path";
 
 export const DEFAULT_SOURCE_DIR = "~/Desktop";
 export const DEFAULT_DEST_ROOT =
@@ -445,7 +445,6 @@ export function parseScreenshotFilename(
     SCREEN_RECORDING_CANDIDATE_REGEX.test(filename) ||
     shotCandidateRegex.test(filename)
   ) {
-    // Only treat as an unparseable screenshot candidate if it doesn't look like a generic document name
     const prefixUsed = screenshotPrefix.trim() || DEFAULT_SCREENSHOT_PREFIX;
     const remainder = filename.startsWith("Screen Recording ")
       ? filename.slice("Screen Recording ".length)
@@ -586,6 +585,45 @@ async function runRsyncBatchCopy(
   const args = ["-aXN", "--", ...sourcePaths, destDirWithSlash];
   const output = await execSubprocess("rsync", args, SUBPROCESS_ENV);
   return { ok: output.code === 0, stderr: output.stderr.trim() };
+}
+
+/**
+ * Verify multiple source files against their copies in `destDir/` in a single
+ * `rsync --dry-run -aN --checksum --itemize-changes` invocation.
+ */
+async function runRsyncBatchChecksumVerify(
+  sourcePaths: string[],
+  destDir: string,
+): Promise<{ ok: boolean; details: string }> {
+  if (sourcePaths.length === 0) {
+    return { ok: true, details: "rsync batch checksum verified" };
+  }
+  const destDirWithSlash = destDir.endsWith("/") ? destDir : `${destDir}/`;
+  const args = [
+    "--dry-run",
+    "-aN",
+    "--checksum",
+    "--itemize-changes",
+    "--",
+    ...sourcePaths,
+    destDirWithSlash,
+  ];
+  const output = await execSubprocess("rsync", args, SUBPROCESS_ENV);
+  const stdout = output.stdout.trim();
+  const stderr = output.stderr.trim();
+  if (output.code !== 0) {
+    return {
+      ok: false,
+      details: stderr || `rsync exited with code ${output.code}`,
+    };
+  }
+  if (stdout.length > 0) {
+    return {
+      ok: false,
+      details: `rsync checksum check reported differences: ${stdout}`,
+    };
+  }
+  return { ok: true, details: "rsync batch checksum verified" };
 }
 
 async function runRsyncChecksumVerify(
@@ -859,6 +897,43 @@ export interface EligibleCandidate {
   destDirExistsBefore: boolean;
 }
 
+function buildCandidateRecord(
+  item: Pick<
+    EligibleCandidate,
+    | "filename"
+    | "kind"
+    | "fileDate"
+    | "sizeBytes"
+    | "dataless"
+    | "hasScreenCaptureXattr"
+    | "sourcePath"
+  >,
+  overrides: {
+    status: CandidateStatus;
+    destDir: string | null;
+    destDirExists: boolean | null;
+    destPath: string | null;
+    sourceDeleted?: boolean;
+    error?: string | null;
+  },
+): CandidateFile {
+  return {
+    filename: item.filename,
+    kind: item.kind,
+    fileDate: item.fileDate,
+    sizeBytes: item.sizeBytes,
+    dataless: item.dataless,
+    hasScreenCaptureXattr: item.hasScreenCaptureXattr,
+    status: overrides.status,
+    sourcePath: item.sourcePath,
+    destDir: overrides.destDir,
+    destDirExists: overrides.destDirExists,
+    destPath: overrides.destPath,
+    sourceDeleted: overrides.sourceDeleted ?? false,
+    error: overrides.error ?? null,
+  };
+}
+
 /**
  * Group eligible candidates by `fileDate` (`YYYY-MM-DD`) in chronological order
  * and build a day-by-day execution plan.
@@ -929,12 +1004,263 @@ export function createArchivePlan<
   };
 }
 
-interface StagedArchiveItem {
-  candidate: EligibleCandidate;
-  state: "deduplicated" | "copied-needs-xattr" | "error";
-  destPath: string;
-  createdNewDestFile: boolean;
-  error: string | null;
+/**
+ * Archive and verify a single file end-to-end (handles deduplication, `(1)`
+ * collision naming, copy, checksum/xattr/birthtime verification, rollback on
+ * failure, and source deletion).
+ */
+async function archiveSingleFile(
+  item: EligibleCandidate,
+  deleteSource: boolean,
+  beforeVerify?: (destPath: string) => Promise<void> | void,
+): Promise<CandidateFile> {
+  let attemptedDestPath: string | null = null;
+  let createdNewDestFile = false;
+  try {
+    const resolved = await resolveDestinationWithDeduplication(
+      item.sourcePath,
+      item.statInfo,
+      item.destDir,
+      item.filename,
+      item.expectedXattr,
+    );
+    attemptedDestPath = resolved.destPath;
+
+    if (resolved.alreadyPresent) {
+      if (deleteSource) {
+        await unlink(item.sourcePath);
+      }
+      return buildCandidateRecord(item, {
+        status: deleteSource
+          ? "archived-deduplicated"
+          : "already-present-verified",
+        destDir: item.destDir,
+        destDirExists: true,
+        destPath: resolved.destPath,
+        sourceDeleted: deleteSource,
+      });
+    }
+
+    const finalDestPath = resolved.destPath;
+    createdNewDestFile = true;
+
+    const copyResult = await runRsyncCopy(item.sourcePath, finalDestPath);
+    if (!copyResult.ok) {
+      throw new Error(`rsync copy failed: ${copyResult.stderr}`);
+    }
+
+    if (beforeVerify) {
+      await beforeVerify(finalDestPath);
+    }
+
+    const verifyResult = await runRsyncChecksumVerify(
+      item.sourcePath,
+      finalDestPath,
+      true,
+    );
+    if (!verifyResult.ok) {
+      throw new Error(verifyResult.details);
+    }
+
+    const [destStat, destXattrs] = await Promise.all([
+      stat(finalDestPath),
+      getExtendedAttributesMap([finalDestPath]),
+    ]);
+
+    if (destStat.size !== item.sizeBytes) {
+      throw new Error(
+        `Size mismatch (src=${item.sizeBytes}, dst=${destStat.size})`,
+      );
+    }
+    if (!destXattrs.get(finalDestPath)?.has(item.expectedXattr)) {
+      throw new Error(
+        `Destination file is missing expected extended attribute ${item.expectedXattr}: ${finalDestPath}`,
+      );
+    }
+    if (!birthtimesMatch(item.statInfo.birthtime, destStat.birthtime)) {
+      throw new Error(
+        `Destination file creation timestamp mismatch: ${finalDestPath}`,
+      );
+    }
+
+    createdNewDestFile = false;
+    if (deleteSource) {
+      await unlink(item.sourcePath);
+    }
+
+    return buildCandidateRecord(item, {
+      status: deleteSource ? "archived" : "copied-verified",
+      destDir: item.destDir,
+      destDirExists: true,
+      destPath: finalDestPath,
+      sourceDeleted: deleteSource,
+    });
+  } catch (err) {
+    if (createdNewDestFile && attemptedDestPath) {
+      try {
+        await rm(attemptedDestPath, { force: true });
+      } catch {
+        // Ignore if destination file was never created before failure
+      }
+    }
+    return buildCandidateRecord(item, {
+      status: "error",
+      destDir: item.destDir,
+      destDirExists: item.destDirExistsBefore,
+      destPath: attemptedDestPath ?? join(item.destDir, item.filename),
+      sourceDeleted: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Fast 3-call batch pipeline for collision-free files in a single day's folder:
+ *   1. `rsync -aXN -- <sources...> <destDir>/`
+ *   2. `rsync --dry-run -aN --checksum --itemize-changes -- <sources...> <destDir>/`
+ *   3. `xattr -- <destPaths...>`
+ * Returns `null` if any step fails so the caller can fall back to `archiveSingleFile`.
+ */
+async function tryArchiveFreshBatch(
+  freshItems: readonly EligibleCandidate[],
+  destDir: string,
+  deleteSource: boolean,
+): Promise<CandidateFile[] | null> {
+  if (freshItems.length === 0) return [];
+  const sourcePaths = freshItems.map((item) => item.sourcePath);
+  const destPaths = freshItems.map((item) => join(destDir, item.filename));
+
+  const cleanupDestPaths = async (): Promise<void> => {
+    for (const p of destPaths) {
+      try {
+        await rm(p, { force: true });
+      } catch {
+        // Ignore cleanup failure
+      }
+    }
+  };
+
+  try {
+    const copyRes = await runRsyncBatchCopy(sourcePaths, destDir);
+    if (!copyRes.ok) {
+      await cleanupDestPaths();
+      return null;
+    }
+
+    const verifyRes = await runRsyncBatchChecksumVerify(sourcePaths, destDir);
+    if (!verifyRes.ok) {
+      await cleanupDestPaths();
+      return null;
+    }
+
+    const xattrMap = await getExtendedAttributesMap(destPaths);
+    for (let i = 0; i < freshItems.length; i += 1) {
+      const item = freshItems[i];
+      const destPath = destPaths[i];
+      if (!xattrMap.get(destPath)?.has(item.expectedXattr)) {
+        await cleanupDestPaths();
+        return null;
+      }
+    }
+  } catch {
+    await cleanupDestPaths();
+    return null;
+  }
+
+  // All files in `freshItems` are copied and verified; now remove sources if requested
+  const results: CandidateFile[] = [];
+  for (let i = 0; i < freshItems.length; i += 1) {
+    const item = freshItems[i];
+    const destPath = destPaths[i];
+    try {
+      if (deleteSource) {
+        await unlink(item.sourcePath);
+      }
+      results.push(
+        buildCandidateRecord(item, {
+          status: deleteSource ? "archived" : "copied-verified",
+          destDir,
+          destDirExists: true,
+          destPath,
+          sourceDeleted: deleteSource,
+        }),
+      );
+    } catch (err) {
+      results.push(
+        buildCandidateRecord(item, {
+          status: "error",
+          destDir,
+          destDirExists: true,
+          destPath,
+          sourceDeleted: false,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Execute a single day-batch by partitioning into collision-free `fresh` files
+ * (eligible for the 3-subprocess batch fast path) and `colliding` files
+ * (handled individually for deduplication or `(1)` suffixing).
+ */
+async function executeDayArchiveBatch(
+  batch: readonly EligibleCandidate[],
+  destDir: string,
+  existingNamesInDayDir: Set<string>,
+  deleteSource: boolean,
+  concurrency: number,
+  beforeVerify?: (destPath: string) => Promise<void> | void,
+): Promise<CandidateFile[]> {
+  const results = new Array<CandidateFile>(batch.length);
+  const freshIndices: number[] = [];
+  const collidingIndices: number[] = [];
+
+  for (let i = 0; i < batch.length; i += 1) {
+    if (existingNamesInDayDir.has(batch[i].filename)) {
+      collidingIndices.push(i);
+    } else {
+      freshIndices.push(i);
+    }
+  }
+
+  if (freshIndices.length > 0) {
+    const freshItems = freshIndices.map((idx) => batch[idx]);
+    const fastResults = !beforeVerify
+      ? await tryArchiveFreshBatch(freshItems, destDir, deleteSource)
+      : null;
+
+    const resolvedFreshResults =
+      fastResults ??
+      (await mapWithConcurrency(freshItems, concurrency, (item) =>
+        archiveSingleFile(item, deleteSource, beforeVerify),
+      ));
+
+    for (let j = 0; j < freshIndices.length; j += 1) {
+      const result = resolvedFreshResults[j];
+      results[freshIndices[j]] = result;
+      if (result.status !== "error") {
+        existingNamesInDayDir.add(result.filename);
+      }
+    }
+  }
+
+  if (collidingIndices.length > 0) {
+    const collidingItems = collidingIndices.map((idx) => batch[idx]);
+    const collidingResults = await mapWithConcurrency(
+      collidingItems,
+      concurrency,
+      (item) => archiveSingleFile(item, deleteSource, beforeVerify),
+    );
+    for (let j = 0; j < collidingIndices.length; j += 1) {
+      results[collidingIndices[j]] = collidingResults[j];
+    }
+  }
+
+  return results;
 }
 
 /**
@@ -970,7 +1296,6 @@ export async function inspectAndProcess(
   );
   const runId = options?.runId ?? randomUUID();
 
-  // Validate dateFormat upfront
   formatDateSubpath("2026-11-05", dateFormat);
 
   if (!(await isDirectory(sourceDir))) {
@@ -1077,21 +1402,25 @@ export async function inspectAndProcess(
 
     if (keepToday && fileDate >= today) {
       skippedTodayCount += 1;
-      files.push({
-        filename,
-        kind,
-        fileDate,
-        sizeBytes,
-        dataless,
-        hasScreenCaptureXattr,
-        status: "skipped-today",
-        sourcePath,
-        destDir: null,
-        destDirExists: null,
-        destPath: null,
-        sourceDeleted: false,
-        error: null,
-      });
+      files.push(
+        buildCandidateRecord(
+          {
+            filename,
+            kind,
+            fileDate,
+            sizeBytes,
+            dataless,
+            hasScreenCaptureXattr,
+            sourcePath,
+          },
+          {
+            status: "skipped-today",
+            destDir: null,
+            destDirExists: null,
+            destPath: null,
+          },
+        ),
+      );
       continue;
     }
 
@@ -1150,31 +1479,21 @@ export async function inspectAndProcess(
           },
         );
 
-        const batchCandidateFiles: CandidateFile[] = [];
         let batchDeduplicated = 0;
-        for (const { item, resolved } of batchResults) {
+        const batchCandidateFiles = batchResults.map(({ item, resolved }) => {
           if (resolved.alreadyPresent) {
             deduplicatedCount += 1;
             batchDeduplicated += 1;
           }
-          const record: CandidateFile = {
-            filename: item.filename,
-            kind: item.kind,
-            fileDate: item.fileDate,
-            sizeBytes: item.sizeBytes,
-            dataless: item.dataless,
-            hasScreenCaptureXattr: item.hasScreenCaptureXattr,
+          return buildCandidateRecord(item, {
             status: mode === "scan" ? "ready-to-archive" : "would-archive",
-            sourcePath: item.sourcePath,
             destDir: item.destDir,
             destDirExists: item.destDirExistsBefore,
             destPath: resolved.destPath,
-            sourceDeleted: false,
-            error: null,
-          };
-          files.push(record);
-          batchCandidateFiles.push(record);
-        }
+          });
+        });
+
+        files.push(...batchCandidateFiles);
 
         if (options?.onBatchComplete) {
           await options.onBatchComplete({
@@ -1203,400 +1522,66 @@ export async function inspectAndProcess(
     const existingNamesInDayDir = new Set<string>();
     try {
       await mkdir(dayPlan.destDir, { recursive: true });
-      const existingEntries = await readdir(dayPlan.destDir);
-      for (const name of existingEntries) {
+      for (const name of await readdir(dayPlan.destDir)) {
         existingNamesInDayDir.add(name);
       }
     } catch (err) {
       dayMkdirError = err instanceof Error ? err.message : String(err);
     }
 
+    // 2. Execute each batch in this day
     for (const batch of dayPlan.batches) {
       globalBatchIndex += 1;
 
-      if (dayMkdirError) {
-        const batchCandidateFiles: CandidateFile[] = [];
-        for (const item of batch) {
-          errorCount += 1;
-          const record: CandidateFile = {
-            filename: item.filename,
-            kind: item.kind,
-            fileDate: item.fileDate,
-            sizeBytes: item.sizeBytes,
-            dataless: item.dataless,
-            hasScreenCaptureXattr: item.hasScreenCaptureXattr,
-            status: "error",
-            sourcePath: item.sourcePath,
-            destDir: item.destDir,
-            destDirExists: item.destDirExistsBefore,
-            destPath: join(item.destDir, item.filename),
-            sourceDeleted: false,
-            error: `mkdir failed for ${item.destDir}: ${dayMkdirError}`,
-          };
-          files.push(record);
-          batchCandidateFiles.push(record);
-        }
-        if (options?.onBatchComplete) {
-          await options.onBatchComplete({
-            runId,
-            mode: effectiveMode,
-            fileDate: dayPlan.fileDate,
-            batchIndex: globalBatchIndex,
-            totalBatches: plan.batchCount,
-            timestamp: new Date().toISOString(),
-            sourceDir,
-            destRoot,
-            files: batchCandidateFiles,
-            batchCopiedVerifiedCount: 0,
-            batchDeduplicatedCount: 0,
-            batchArchivedCount: 0,
-            batchErrorCount: batchCandidateFiles.length,
-          });
-        }
-        continue;
-      }
-
-      // Check if we can use the fast multi-file single-rsync call for this day-batch:
-      // Eligible when no file in the batch collides with an existing filename in destDir
-      // and no test-only `beforeVerify` corruption hook is injected.
-      const hasAnyCollision = batch.some((item) =>
-        existingNamesInDayDir.has(item.filename),
-      );
-      let stagedItems: StagedArchiveItem[] | null = null;
-
-      if (!hasAnyCollision && !options?.beforeVerify) {
-        const batchCopy = await runRsyncBatchCopy(
-          batch.map((item) => item.sourcePath),
-          dayPlan.destDir,
-        );
-        if (batchCopy.ok) {
-          stagedItems = await mapWithConcurrency(
+      const batchCandidateFiles = dayMkdirError
+        ? batch.map((item) =>
+            buildCandidateRecord(item, {
+              status: "error",
+              destDir: item.destDir,
+              destDirExists: item.destDirExistsBefore,
+              destPath: join(item.destDir, item.filename),
+              error: `mkdir failed for ${item.destDir}: ${dayMkdirError}`,
+            }),
+          )
+        : await executeDayArchiveBatch(
             batch,
+            dayPlan.destDir,
+            existingNamesInDayDir,
+            deleteSource,
             concurrency,
-            async (item): Promise<StagedArchiveItem> => {
-              const finalDestPath = join(item.destDir, item.filename);
-              try {
-                const verifyResult = await runRsyncChecksumVerify(
-                  item.sourcePath,
-                  finalDestPath,
-                  true,
-                );
-                if (!verifyResult.ok) {
-                  throw new Error(verifyResult.details);
-                }
-                const destStat = await stat(finalDestPath);
-                if (destStat.size !== item.sizeBytes) {
-                  throw new Error(
-                    `Size mismatch (src=${item.sizeBytes}, dst=${destStat.size})`,
-                  );
-                }
-                if (
-                  !birthtimesMatch(item.statInfo.birthtime, destStat.birthtime)
-                ) {
-                  throw new Error(
-                    `Destination file creation timestamp mismatch: ${finalDestPath}`,
-                  );
-                }
-                return {
-                  candidate: item,
-                  state: "copied-needs-xattr",
-                  destPath: finalDestPath,
-                  createdNewDestFile: true,
-                  error: null,
-                };
-              } catch (err) {
-                try {
-                  await rm(finalDestPath, { force: true });
-                } catch {
-                  // Ignore cleanup error
-                }
-                return {
-                  candidate: item,
-                  state: "error",
-                  destPath: finalDestPath,
-                  createdNewDestFile: false,
-                  error: err instanceof Error ? err.message : String(err),
-                };
-              }
-            },
+            options?.beforeVerify,
           );
-        } else {
-          // Clean up any partial files written before falling back to per-file copy
-          for (const item of batch) {
-            try {
-              await rm(join(item.destDir, item.filename), { force: true });
-            } catch {
-              // Ignore
-            }
-          }
-        }
-      }
 
-      // Per-file fallback / collision & deduplication path
-      if (!stagedItems) {
-        stagedItems = await mapWithConcurrency(
-          batch,
-          concurrency,
-          async (item): Promise<StagedArchiveItem> => {
-            let attemptedDestPath: string | null = null;
-            let createdNewDestFile = false;
-            try {
-              const resolved = await resolveDestinationWithDeduplication(
-                item.sourcePath,
-                item.statInfo,
-                item.destDir,
-                item.filename,
-                item.expectedXattr,
-              );
-              attemptedDestPath = resolved.destPath;
-
-              if (resolved.alreadyPresent) {
-                return {
-                  candidate: item,
-                  state: "deduplicated",
-                  destPath: resolved.destPath,
-                  createdNewDestFile: false,
-                  error: null,
-                };
-              }
-
-              const finalDestPath = resolved.destPath;
-              createdNewDestFile = true;
-
-              const copyResult = await runRsyncCopy(
-                item.sourcePath,
-                finalDestPath,
-              );
-              if (!copyResult.ok) {
-                throw new Error(`rsync copy failed: ${copyResult.stderr}`);
-              }
-
-              if (options?.beforeVerify) {
-                await options.beforeVerify(finalDestPath);
-              }
-
-              const verifyResult = await runRsyncChecksumVerify(
-                item.sourcePath,
-                finalDestPath,
-                true,
-              );
-              if (!verifyResult.ok) {
-                throw new Error(verifyResult.details);
-              }
-
-              const destStat = await stat(finalDestPath);
-              if (destStat.size !== item.sizeBytes) {
-                throw new Error(
-                  `Size mismatch (src=${item.sizeBytes}, dst=${destStat.size})`,
-                );
-              }
-              if (
-                !birthtimesMatch(item.statInfo.birthtime, destStat.birthtime)
-              ) {
-                throw new Error(
-                  `Destination file creation timestamp mismatch: ${finalDestPath}`,
-                );
-              }
-
-              return {
-                candidate: item,
-                state: "copied-needs-xattr",
-                destPath: finalDestPath,
-                createdNewDestFile: true,
-                error: null,
-              };
-            } catch (err) {
-              if (createdNewDestFile && attemptedDestPath) {
-                try {
-                  await rm(attemptedDestPath, { force: true });
-                } catch {
-                  // Ignore if destination file was never created before failure
-                }
-              }
-              return {
-                candidate: item,
-                state: "error",
-                destPath: attemptedDestPath ?? join(item.destDir, item.filename),
-                createdNewDestFile: false,
-                error: err instanceof Error ? err.message : String(err),
-              };
-            }
-          },
-        );
-      }
-
-      // Batch-verify destination extended attributes across the batch (1 xattr call per batch)
-      const copiedToVerifyPaths = stagedItems
-        .filter((s) => s.state === "copied-needs-xattr")
-        .map((s) => s.destPath);
-
-      let batchDestXattrs = new Map<string, Set<string>>();
-      if (copiedToVerifyPaths.length > 0) {
-        try {
-          batchDestXattrs = await getExtendedAttributesMap(copiedToVerifyPaths);
-        } catch {
-          for (const p of copiedToVerifyPaths) {
-            try {
-              const single = await getExtendedAttributesMap([p]);
-              const attrs = single.get(p);
-              if (attrs) {
-                batchDestXattrs.set(p, attrs);
-              }
-            } catch {
-              // Leave missing in batchDestXattrs so the specific file fails verification below
-            }
-          }
-        }
-      }
-
-      // Finalize verification, delete verified source files, and build batch records
-      const batchCandidateFiles: CandidateFile[] = [];
       let batchCopiedVerified = 0;
       let batchDeduplicated = 0;
       let batchArchived = 0;
       let batchErrors = 0;
 
-      for (const staged of stagedItems) {
-        const { candidate } = staged;
-
-        if (staged.state === "error") {
+      for (const record of batchCandidateFiles) {
+        files.push(record);
+        if (record.status === "error") {
           errorCount += 1;
           batchErrors += 1;
-          const record: CandidateFile = {
-            filename: candidate.filename,
-            kind: candidate.kind,
-            fileDate: candidate.fileDate,
-            sizeBytes: candidate.sizeBytes,
-            dataless: candidate.dataless,
-            hasScreenCaptureXattr: candidate.hasScreenCaptureXattr,
-            status: "error",
-            sourcePath: candidate.sourcePath,
-            destDir: candidate.destDir,
-            destDirExists: candidate.destDirExistsBefore,
-            destPath: staged.destPath,
-            sourceDeleted: false,
-            error: staged.error,
-          };
-          files.push(record);
-          batchCandidateFiles.push(record);
-          continue;
-        }
-
-        if (staged.state === "deduplicated") {
-          try {
-            if (deleteSource) {
-              await unlink(candidate.sourcePath);
-              archivedCount += 1;
-              batchArchived += 1;
-            }
-            deduplicatedCount += 1;
-            batchDeduplicated += 1;
-            const record: CandidateFile = {
-              filename: candidate.filename,
-              kind: candidate.kind,
-              fileDate: candidate.fileDate,
-              sizeBytes: candidate.sizeBytes,
-              dataless: candidate.dataless,
-              hasScreenCaptureXattr: candidate.hasScreenCaptureXattr,
-              status: deleteSource
-                ? "archived-deduplicated"
-                : "already-present-verified",
-              sourcePath: candidate.sourcePath,
-              destDir: candidate.destDir,
-              destDirExists: true,
-              destPath: staged.destPath,
-              sourceDeleted: deleteSource,
-              error: null,
-            };
-            files.push(record);
-            batchCandidateFiles.push(record);
-          } catch (err) {
-            errorCount += 1;
-            batchErrors += 1;
-            const record: CandidateFile = {
-              filename: candidate.filename,
-              kind: candidate.kind,
-              fileDate: candidate.fileDate,
-              sizeBytes: candidate.sizeBytes,
-              dataless: candidate.dataless,
-              hasScreenCaptureXattr: candidate.hasScreenCaptureXattr,
-              status: "error",
-              sourcePath: candidate.sourcePath,
-              destDir: candidate.destDir,
-              destDirExists: true,
-              destPath: staged.destPath,
-              sourceDeleted: false,
-              error: err instanceof Error ? err.message : String(err),
-            };
-            files.push(record);
-            batchCandidateFiles.push(record);
-          }
-          continue;
-        }
-
-        // staged.state === "copied-needs-xattr"
-        try {
-          const destAttrs = batchDestXattrs.get(staged.destPath);
-          if (!destAttrs?.has(candidate.expectedXattr)) {
-            throw new Error(
-              `Destination file is missing expected extended attribute ${candidate.expectedXattr}: ${staged.destPath}`,
-            );
-          }
-
-          copiedVerifiedCount += 1;
-          batchCopiedVerified += 1;
-          existingNamesInDayDir.add(candidate.filename);
-
-          if (deleteSource) {
-            await unlink(candidate.sourcePath);
+        } else if (
+          record.status === "archived-deduplicated" ||
+          record.status === "already-present-verified"
+        ) {
+          deduplicatedCount += 1;
+          batchDeduplicated += 1;
+          if (record.sourceDeleted) {
             archivedCount += 1;
             batchArchived += 1;
           }
-
-          const record: CandidateFile = {
-            filename: candidate.filename,
-            kind: candidate.kind,
-            fileDate: candidate.fileDate,
-            sizeBytes: candidate.sizeBytes,
-            dataless: candidate.dataless,
-            hasScreenCaptureXattr: candidate.hasScreenCaptureXattr,
-            status: deleteSource ? "archived" : "copied-verified",
-            sourcePath: candidate.sourcePath,
-            destDir: candidate.destDir,
-            destDirExists: true,
-            destPath: staged.destPath,
-            sourceDeleted: deleteSource,
-            error: null,
-          };
-          files.push(record);
-          batchCandidateFiles.push(record);
-        } catch (err) {
-          if (staged.createdNewDestFile) {
-            try {
-              await rm(staged.destPath, { force: true });
-            } catch {
-              // Ignore cleanup failure
-            }
+        } else if (
+          record.status === "archived" ||
+          record.status === "copied-verified"
+        ) {
+          copiedVerifiedCount += 1;
+          batchCopiedVerified += 1;
+          if (record.sourceDeleted) {
+            archivedCount += 1;
+            batchArchived += 1;
           }
-          errorCount += 1;
-          batchErrors += 1;
-          const record: CandidateFile = {
-            filename: candidate.filename,
-            kind: candidate.kind,
-            fileDate: candidate.fileDate,
-            sizeBytes: candidate.sizeBytes,
-            dataless: candidate.dataless,
-            hasScreenCaptureXattr: candidate.hasScreenCaptureXattr,
-            status: "error",
-            sourcePath: candidate.sourcePath,
-            destDir: candidate.destDir,
-            destDirExists: candidate.destDirExistsBefore,
-            destPath: staged.destPath,
-            sourceDeleted: false,
-            error: err instanceof Error ? err.message : String(err),
-          };
-          files.push(record);
-          batchCandidateFiles.push(record);
         }
       }
 
@@ -1620,7 +1605,6 @@ export async function inspectAndProcess(
     }
   }
 
-  // Keep output `files` sorted deterministically by filename
   files.sort((a, b) => a.filename.localeCompare(b.filename));
 
   return {

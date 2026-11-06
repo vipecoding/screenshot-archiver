@@ -859,6 +859,37 @@ describe("screenshot-archiver", () => {
         { date: "2020-11-02", count: 2 },
       ]);
       expect(result.files.map((f) => f.filename)).toEqual(filenames);
+
+      // Mixed batch test: 1 already-archived file + 2 brand-new files in the same day (2020-11-01)
+      const mixedExisting = "Screenshot 2020-11-01 at 10.00.01 AM.png";
+      const mixedNew1 = "Screenshot 2020-11-01 at 10.00.08 AM.png";
+      const mixedNew2 = "Screenshot 2020-11-01 at 10.00.09 AM.png";
+      for (const name of [mixedExisting, mixedNew1, mixedNew2]) {
+        const p = `${sourceDir}/${name}`;
+        await writeFile(p, `payload-${name}`, "utf8");
+        await setXattr(p, "com.apple.metadata:kMDItemIsScreenCapture");
+      }
+
+      const mixedResult = await inspectAndProcess(
+        {
+          sourceDir,
+          destRoot,
+          dateFormat: "YYYY/MM/DD",
+          keepToday: true,
+        },
+        "archive",
+        "2020-11-05",
+      );
+      expect(mixedResult.dayCount).toBe(1);
+      expect(mixedResult.batchCount).toBe(1);
+      expect(mixedResult.copiedVerifiedCount).toBe(2);
+      expect(mixedResult.deduplicatedCount).toBe(1);
+      expect(mixedResult.archivedCount).toBe(3);
+      expect(mixedResult.files.map((f) => f.status)).toEqual([
+        "archived-deduplicated",
+        "archived",
+        "archived",
+      ]);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
