@@ -1,0 +1,20 @@
+{
+  "name": "screenshot-archiver",
+  "version": "1.0.0",
+  "description": "Standalone macOS CLI and nightly launchd service to archive Desktop screenshots and screen recordings into Obsidian/iCloud date folders via verified rsync -aXN + checksum + xattr.",
+  "type": "module",
+  "bin": {
+    "screenshot-archiver": "./bin/screenshot-archiver"
+  },
+  "scripts": {
+    "build": "bun build --compile src/cli.ts --outfile bin/screenshot-archiver",
+    "test": "bun test",
+    "start": "bun run src/cli.ts",
+    "scan": "bun run src/cli.ts scan",
+    "archive": "bun run src/cli.ts archive",
+    "history": "bun run src/cli.ts history",
+    "install-agent": "bun run build && bash bin/build_runner_app.sh && mkdir -p logs && cp launchd/com.matthew.screenshot-archiver.plist ~/Library/LaunchAgents/com.matthew.screenshot-archiver.plist && (launchctl bootout gui/$(id -u)/com.matthew.screenshot-archiver 2>/dev/null || true) && launchctl enable gui/$(id -u)/com.matthew.screenshot-archiver && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.matthew.screenshot-archiver.plist",
+    "diagnose": "bash bin/diagnose_agent.sh"
+  },
+  "license": "MIT"
+}
